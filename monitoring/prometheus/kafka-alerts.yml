@@ -1,0 +1,278 @@
+groups:
+  - name: kafka-broker-capacity
+    rules:
+      - record: kafka:broker_log_size_bytes:sum
+        expr: |
+          sum by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.log",
+              mbean=~"kafka.log:type=Log,name=Size,topic=.*,partition=.*",
+              attribute="Value"
+            }
+          )
+
+      - alert: KafkaBrokerDiskUsageHigh
+        expr: kafka:broker_log_size_bytes:sum > 5e10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka broker log size is high on {{ $labels.broker }}"
+          description: "Summed kafka.log Log.Size exceeds 50 GB for 15 minutes."
+
+  - name: kafka-host-and-jvm-scrape
+    rules:
+      - alert: NodeExporterTargetDown
+        expr: up{job="node_exporter"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "node_exporter target is down"
+          description: "Prometheus cannot scrape node_exporter for host disk signals."
+
+      - alert: KafkaHostDiskUsageHigh
+        expr: |
+          max by (instance, mountpoint) (
+            100 * (
+              1 - (
+                node_filesystem_avail_bytes{
+                  job="node_exporter",
+                  fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2fs|tracefs|ramfs",
+                  mountpoint!~"/(sys|proc|dev|run)($|/)"
+                }
+                /
+                node_filesystem_size_bytes{
+                  job="node_exporter",
+                  fstype!~"tmpfs|overlay|squashfs|nsfs|proc|sysfs|cgroup2fs|tracefs|ramfs",
+                  mountpoint!~"/(sys|proc|dev|run)($|/)"
+                }
+              )
+            )
+          ) > 85
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host disk usage is high on {{ $labels.instance }} {{ $labels.mountpoint }}"
+          description: "node_exporter filesystem usage is above 85% for 15 minutes."
+
+      - alert: KafkaJvmGcTimeHigh
+        expr: |
+          sum by (broker) (
+            rate(
+              kafka_jmx_attribute_value{
+                domain="java.lang",
+                mbean=~"java.lang:name=G1 (Young|Old) Generation,type=GarbageCollector",
+                attribute="CollectionTime"
+              }[5m]
+            )
+          ) > 200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "JVM GC time is elevated on {{ $labels.broker }}"
+          description: "GC collection time rate is above 200 ms/sec over 5 minutes."
+
+      - alert: KafkaFileDescriptorUsageHigh
+        expr: |
+          max by (broker) (
+            100 *
+            kafka_jmx_attribute_value{
+              domain="java.lang",
+              mbean=~"java.lang:type=OperatingSystem.*",
+              attribute="OpenFileDescriptorCount"
+            }
+            /
+            ignoring(attribute)
+            kafka_jmx_attribute_value{
+              domain="java.lang",
+              mbean=~"java.lang:type=OperatingSystem.*",
+              attribute="MaxFileDescriptorCount"
+            }
+          ) > 80
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka broker file descriptor usage is high on {{ $labels.broker }}"
+          description: "OpenFileDescriptorCount exceeds 80% of MaxFileDescriptorCount for 10 minutes."
+
+  - name: kafka-request-latency
+    rules:
+      - record: kafka:broker_produce_request_p99_ms:max
+        expr: |
+          max by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.network",
+              mbean=~"kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce.*",
+              attribute="99thPercentile"
+            }
+          )
+
+      - record: kafka:broker_fetchconsumer_request_p99_ms:max
+        expr: |
+          max by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.network",
+              mbean=~"kafka.network:type=RequestMetrics,name=TotalTimeMs,request=FetchConsumer.*",
+              attribute="99thPercentile"
+            }
+          )
+
+      - alert: KafkaProduceRequestLatencyP99High
+        expr: kafka:broker_produce_request_p99_ms:max > 1000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Produce p99 latency is high on {{ $labels.broker }}"
+          description: "Produce TotalTimeMs 99th percentile is above 1000ms for 10 minutes."
+
+      - alert: KafkaFetchConsumerRequestLatencyP99High
+        expr: kafka:broker_fetchconsumer_request_p99_ms:max > 1500
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "FetchConsumer p99 latency is high on {{ $labels.broker }}"
+          description: "FetchConsumer TotalTimeMs 99th percentile is above 1500ms for 10 minutes."
+
+      - alert: KafkaRequestLatencyMetricsMissing
+        expr: |
+          absent(
+            kafka_jmx_attribute_value{
+              domain="kafka.network",
+              mbean=~"kafka.network:type=RequestMetrics,name=TotalTimeMs,request=Produce.*",
+              attribute="99thPercentile"
+            }
+          )
+          or
+          absent(
+            kafka_jmx_attribute_value{
+              domain="kafka.network",
+              mbean=~"kafka.network:type=RequestMetrics,name=TotalTimeMs,request=FetchConsumer.*",
+              attribute="99thPercentile"
+            }
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka request latency percentile metrics are missing"
+          description: "Prometheus is not receiving one or more request TotalTimeMs p99 series."
+
+  - name: kafka-isr-and-leader-health
+    rules:
+      - alert: KafkaIsrShrinkRateNonZero
+        expr: |
+          max by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.server",
+              mbean=~"kafka.server:type=ReplicaManager,name=IsrShrinksPerSec.*",
+              attribute="OneMinuteRate"
+            }
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ISR shrink activity detected on {{ $labels.broker }}"
+          description: "IsrShrinksPerSec OneMinuteRate has been > 0 for 10 minutes."
+
+      - alert: KafkaActiveControllerCountInvalid
+        expr: |
+          sum(
+            kafka_jmx_attribute_value{
+              domain="kafka.controller",
+              mbean=~"kafka.controller:type=KafkaController,name=ActiveControllerCount.*",
+              attribute="Value"
+            }
+          ) != 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka active controller count is invalid"
+          description: "Expected exactly one active controller across the cluster."
+
+      - alert: KafkaOfflinePartitionsNonZero
+        expr: |
+          max by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.controller",
+              mbean=~"kafka.controller:type=KafkaController,name=OfflinePartitionsCount.*",
+              attribute="Value"
+            }
+          ) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka offline partitions detected on {{ $labels.broker }}"
+          description: "OfflinePartitionsCount is non-zero."
+
+      - alert: KafkaUnderReplicatedPartitionsNonZero
+        expr: |
+          max by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.server",
+              mbean=~"kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions.*",
+              attribute="Value"
+            }
+          ) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kafka under-replicated partitions detected on {{ $labels.broker }}"
+          description: "UnderReplicatedPartitions is non-zero."
+
+      - alert: KafkaPreferredReplicaImbalanceNonZero
+        expr: |
+          max by (broker) (
+            kafka_jmx_attribute_value{
+              domain="kafka.controller",
+              mbean=~"kafka.controller:type=KafkaController,name=PreferredReplicaImbalanceCount.*",
+              attribute="Value"
+            }
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Preferred replica imbalance is non-zero on {{ $labels.broker }}"
+          description: "Leader placement is imbalanced for at least 10 minutes."
+
+      - alert: KafkaIsrLeaderMetricsMissing
+        expr: |
+          absent(
+            kafka_jmx_attribute_value{
+              domain="kafka.server",
+              mbean=~"kafka.server:type=ReplicaManager,name=IsrShrinksPerSec.*",
+              attribute="OneMinuteRate"
+            }
+          )
+          or
+          absent(
+            kafka_jmx_attribute_value{
+              domain="kafka.controller",
+              mbean=~"kafka.controller:type=KafkaController,name=ActiveControllerCount.*",
+              attribute="Value"
+            }
+          )
+          or
+          absent(
+            kafka_jmx_attribute_value{
+              domain="kafka.server",
+              mbean=~"kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions.*",
+              attribute="Value"
+            }
+          )
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka ISR/leader health metrics are missing"
+          description: "Prometheus is missing one or more required ISR/controller/under-replication series."

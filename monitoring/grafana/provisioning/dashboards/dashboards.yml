@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: Kafka JMX Dashboards
+    orgId: 1
+    folder: Kafka
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /etc/grafana/dashboards

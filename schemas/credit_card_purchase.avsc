@@ -1,0 +1,59 @@
+{
+  "type": "record",
+  "name": "CreditCardPurchase",
+  "namespace": "com.example.payments",
+  "fields": [
+    {
+      "name": "purchase_id",
+      "type": "string"
+    },
+    {
+      "name": "event_time",
+      "type": "string"
+    },
+    {
+      "name": "card_last4",
+      "type": "string"
+    },
+    {
+      "name": "card_brand",
+      "type": "string"
+    },
+    {
+      "name": "merchant",
+      "type": "string"
+    },
+    {
+      "name": "category",
+      "type": "string"
+    },
+    {
+      "name": "city",
+      "type": "string"
+    },
+    {
+      "name": "state",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "double"
+    },
+    {
+      "name": "currency",
+      "type": "string"
+    },
+    {
+      "name": "is_card_present",
+      "type": "boolean"
+    },
+    {
+      "name": "device_type",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    }
+  ]
+}

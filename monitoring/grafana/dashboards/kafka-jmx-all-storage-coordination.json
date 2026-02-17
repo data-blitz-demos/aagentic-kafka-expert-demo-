@@ -1,0 +1,86 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "center", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "editorMode": "code", "expr": "count(count by (domain,mbean,attribute)(kafka_jmx_attribute_value{domain=~\"kafka.log|kafka.coordinator.group|kafka.coordinator.transaction\",broker=~\"$broker\"}))", "range": true, "refId": "A"}],
+      "title": "Unique Attributes in Group",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}}, "overrides": []},
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 0},
+      "id": 2,
+      "options": {"colorMode": "value", "graphMode": "none", "justifyMode": "center", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "editorMode": "code", "expr": "count(count by (broker)(kafka_jmx_attribute_value{domain=~\"kafka.log|kafka.coordinator.group|kafka.coordinator.transaction\",broker=~\"$broker\"}))", "range": true, "refId": "A"}],
+      "title": "Brokers Reporting",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 5, "w": 12, "x": 12, "y": 0},
+      "id": 3,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "editorMode": "code", "expr": "count by (domain) (kafka_jmx_attribute_value{domain=~\"kafka.log|kafka.coordinator.group|kafka.coordinator.transaction\",broker=~\"$broker\"})", "legendFormat": "{{domain}}", "range": true, "refId": "A"}],
+      "title": "Series Count by Domain",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 5},
+      "id": 4,
+      "options": {"footer": {"countRows": false, "enablePagination": true, "show": true}, "showHeader": true},
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "editorMode": "code", "expr": "kafka_jmx_attribute_value{domain=~\"kafka.log|kafka.coordinator.group|kafka.coordinator.transaction\",broker=~\"$broker\"}", "format": "table", "instant": true, "range": false, "refId": "A"}],
+      "title": "All Storage/Coordination Attributes (Instant)",
+      "type": "table"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["jmx", "kafka", "prometheus", "all-attributes", "log", "coordination"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": true, "text": "All", "value": ".*"},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Broker Regex",
+        "name": "broker",
+        "options": [],
+        "query": ".*",
+        "skipUrlSync": false,
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {"from": "now-30m", "to": "now"},
+  "timezone": "",
+  "title": "Kafka JMX All Attributes - Storage and Coordination",
+  "uid": "kafka-jmx-all-storage-coordination",
+  "version": 1,
+  "weekStart": ""
+}
