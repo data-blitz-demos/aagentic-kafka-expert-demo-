@@ -1,4 +1,4 @@
-# Kafka Expert Demo
+# aagentic-kafka-expert-demo 
 
 Author: `Paul Harvener`  
 Company: `Data-Blitz Inc`
