@@ -15,7 +15,7 @@ It is designed for local use with Docker Compose only.
 This project is controlled by the MIT License.
 
 See:
-- `/Users/paulharvener/workspace/kafka-expert/LICENSE`
+- `./kafka-expert/LICENSE`
 
 ## What Runs
 - 3-node Kafka cluster (KRaft mode, Confluent images)
