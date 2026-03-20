@@ -32,20 +32,31 @@ from pypdf import PdfReader
 
 load_dotenv()
 
+
+def _split_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 UI_PORT = int(os.getenv("KAFKA_EXPERT_UI_PORT", "5052"))
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "http://prometheus:9090")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv(
     "KAFKA_BOOTSTRAP_SERVERS", "kafka1:9092,kafka2:9092,kafka3:9092"
 )
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0").strip() or "0")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "").strip()
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b").strip()
+OLLAMA_MODEL_FALLBACKS = _split_csv(os.getenv("OLLAMA_MODEL_FALLBACKS", "").strip())
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.3")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
-OPENAI_MODEL_FALLBACKS = [
-    model.strip()
-    for model in os.getenv("OPENAI_MODEL_FALLBACKS", "gpt-5.2,gpt-4.1").split(",")
-    if model.strip()
-]
+OPENAI_MODEL_FALLBACKS = _split_csv(os.getenv("OPENAI_MODEL_FALLBACKS", "gpt-5.2,gpt-4.1"))
+HUGGINGFACE_OPENAI_BASE_URL = os.getenv("HUGGINGFACE_OPENAI_BASE_URL", "").strip()
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "").strip()
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct").strip()
+HUGGINGFACE_MODEL_FALLBACKS = _split_csv(os.getenv("HUGGINGFACE_MODEL_FALLBACKS", "").strip())
 KAFKA_UI_PUBLIC_URL = os.getenv("KAFKA_UI_PUBLIC_URL", "http://localhost:8080").strip()
 KAFKA_PRODUCER_UI_PUBLIC_URL = os.getenv(
     "KAFKA_PRODUCER_UI_PUBLIC_URL", "http://localhost:5050"
@@ -83,6 +94,125 @@ def render_prompt(name: str, **kwargs: Any) -> str:
     """Render a string.Template payload so prompts can be updated without code changes."""
     template = Template(_load_prompt_template(name))
     return template.safe_substitute(**kwargs)
+
+
+def _normalize_llm_provider(provider: str) -> str:
+    """Normalize provider name into a supported key."""
+    provider = (provider or "openai").strip().lower()
+    aliases = {
+        "hf": "huggingface",
+        "open source": "ollama",
+    }
+    return aliases.get(provider, provider)
+
+
+def _validate_llm_provider_configuration(component: str) -> None:
+    """Validate required credentials/base URLs for the configured LLM provider."""
+    provider = _normalize_llm_provider(LLM_PROVIDER)
+    if provider == "openai":
+        if not OPENAI_API_KEY:
+            raise RuntimeError(
+                f"{component}: OPENAI_API_KEY is required when LLM_PROVIDER=openai. "
+                f"{_llm_error_message_for_provider(provider)}"
+            )
+        return
+    if provider == "ollama":
+        return
+    if provider == "huggingface":
+        if not HUGGINGFACE_OPENAI_BASE_URL:
+            raise RuntimeError(
+                f"{component}: Hugging Face provider requires HUGGINGFACE_OPENAI_BASE_URL. "
+                f"{_llm_error_message_for_provider(provider)}"
+            )
+        return
+    raise RuntimeError(
+        f"{component}: Unsupported LLM_PROVIDER={provider}. Expected one of: openai, ollama, huggingface."
+    )
+
+
+def _dedupe_models(models: list[str]) -> list[str]:
+    """Remove empty/duplicate models while preserving declaration order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for model_name in models:
+        trimmed = model_name.strip()
+        if not trimmed or trimmed in seen:
+            continue
+        seen.add(trimmed)
+        out.append(trimmed)
+    return out
+
+
+def _model_candidates_for_provider(provider: str) -> list[str]:
+    """Resolve primary + fallback model names for the selected provider."""
+    provider = _normalize_llm_provider(provider)
+    if provider == "openai":
+        return _dedupe_models([OPENAI_MODEL, *OPENAI_MODEL_FALLBACKS])
+    if provider == "ollama":
+        return _dedupe_models([OLLAMA_MODEL, *OLLAMA_MODEL_FALLBACKS])
+    if provider == "huggingface":
+        return _dedupe_models([HUGGINGFACE_MODEL, *HUGGINGFACE_MODEL_FALLBACKS])
+    raise RuntimeError(f"Unsupported LLM_PROVIDER={provider}. Expected one of: openai, ollama, huggingface.")
+
+
+def _requested_model_for_provider(provider: str) -> str:
+    """Return the primary model configured for the provider."""
+    candidates = _model_candidates_for_provider(provider)
+    return candidates[0] if candidates else ""
+
+
+def _llm_base_url_for_provider(provider: str) -> str:
+    """Return base URL for ChatOpenAI-compatible provider backends."""
+    provider = _normalize_llm_provider(provider)
+    if provider == "openai":
+        return OPENAI_BASE_URL
+    if provider == "ollama":
+        return OLLAMA_BASE_URL or "http://localhost:11434/v1"
+    if provider == "huggingface":
+        return HUGGINGFACE_OPENAI_BASE_URL
+    raise RuntimeError(f"Unsupported LLM_PROVIDER={provider}.")
+
+
+def _llm_api_key_for_provider(provider: str) -> str:
+    """Return provider-specific API token when required."""
+    provider = _normalize_llm_provider(provider)
+    if provider == "openai":
+        return OPENAI_API_KEY
+    if provider == "ollama":
+        return OLLAMA_API_KEY or "ollama"
+    if provider == "huggingface":
+        return HUGGINGFACE_API_KEY
+    raise RuntimeError(f"Unsupported LLM_PROVIDER={provider}.")
+
+
+def _llm_error_message_for_provider(provider: str) -> str:
+    """Return a human-readable config requirement for the selected provider."""
+    provider = _normalize_llm_provider(provider)
+    if provider == "openai":
+        return "Set OPENAI_API_KEY (or configure OPENAI_BASE_URL with valid credentials)."
+    if provider == "ollama":
+        return "Set OLLAMA_BASE_URL (default http://localhost:11434/v1) and ensure ollama service is reachable."
+    if provider == "huggingface":
+        return (
+            "Set HUGGINGFACE_OPENAI_BASE_URL to an OpenAI-compatible Hugging Face endpoint. "
+            "HUGGINGFACE_API_KEY may be required."
+        )
+    return f"Unsupported LLM_PROVIDER={provider}."
+
+
+def _build_chat_model_kwargs(model_name: str, provider: str) -> dict[str, Any]:
+    """Build ChatOpenAI kwargs for OpenAI-compatible provider endpoints."""
+    model_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "temperature": LLM_TEMPERATURE,
+    }
+    base_url = _llm_base_url_for_provider(provider)
+    if base_url:
+        model_kwargs["base_url"] = base_url.rstrip("/")
+    api_key = _llm_api_key_for_provider(provider)
+    if api_key:
+        model_kwargs["api_key"] = api_key
+    return model_kwargs
 
 KAFKA_ONLY_MESSAGE = (
     _load_prompt_template("kafka_only_message.txt")
@@ -664,35 +794,28 @@ def _is_model_not_found_error(exc: Exception) -> bool:
     return "model_not_found" in text or "does not exist" in text or "you do not have access" in text
 
 
-def _build_openai_model_kwargs(model_name: str) -> dict[str, Any]:
-    """Build ChatOpenAI kwargs using shared environment configuration."""
-    model_kwargs: dict[str, Any] = {
-        "model": model_name,
-        "api_key": OPENAI_API_KEY,
-        "temperature": 0,
-    }
-    if OPENAI_BASE_URL:
-        model_kwargs["base_url"] = OPENAI_BASE_URL
-    return model_kwargs
-
-
-def build_chat_openai_with_fallback(component: str) -> tuple[ChatOpenAI, str]:
-    """Create a ChatOpenAI client, trying fallback models if the requested one is unavailable."""
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for model_name in [OPENAI_MODEL, *OPENAI_MODEL_FALLBACKS]:
-        trimmed = model_name.strip()
-        if not trimmed or trimmed in seen:
-            continue
-        seen.add(trimmed)
-        candidates.append(trimmed)
+def build_chat_with_fallback(component: str) -> tuple[ChatOpenAI, str]:
+    """Create a ChatOpenAI-compatible client, trying fallback models if the requested one is unavailable."""
+    provider = _normalize_llm_provider(LLM_PROVIDER)
+    candidates = _model_candidates_for_provider(provider)
+    _validate_llm_provider_configuration(component)
 
     if not candidates:
-        raise RuntimeError(f"{component}: no OPENAI model configured.")
+        raise RuntimeError(
+            f"{component}: no model configured for provider '{provider}'. "
+            f"{_llm_error_message_for_provider(provider)}"
+        )
 
     unavailable_errors: list[str] = []
     for model_name in candidates:
-        llm = ChatOpenAI(**_build_openai_model_kwargs(model_name))
+        base_url = _llm_base_url_for_provider(provider)
+        if provider != "openai" and not base_url:
+            raise RuntimeError(
+                f"{component}: base URL is not configured for provider '{provider}'. "
+                f"{_llm_error_message_for_provider(provider)}"
+            )
+
+        llm = ChatOpenAI(**_build_chat_model_kwargs(model_name=model_name, provider=provider))
         try:
             # Probe once so startup chooses a model that the account can actually use.
             llm.invoke("Reply with OK.")
@@ -803,8 +926,7 @@ class GraphRAGRuntime:
 
     def __init__(self) -> None:
         """Initialize Neo4j driver, constraints, and an extraction/answering LLM."""
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is not configured for Graph RAG.")
+        _validate_llm_provider_configuration("Graph RAG")
         if not NEO4J_AUTH_DISABLED and not NEO4J_PASSWORD:
             raise RuntimeError("NEO4J_PASSWORD is not configured.")
 
@@ -820,7 +942,7 @@ class GraphRAGRuntime:
             session.run("RETURN 1 AS ok").single()
             self._ensure_schema(session)
 
-        self._llm, self.model_name = build_chat_openai_with_fallback("Graph RAG")
+        self._llm, self.model_name = build_chat_with_fallback("Graph RAG")
 
     def _ensure_schema(self, session: Any) -> None:
         """Create id/name uniqueness constraints required for graph upserts."""
@@ -1005,6 +1127,8 @@ class GraphRAGRuntime:
         return {
             "neo4j_uri": NEO4J_URI,
             "neo4j_auth_mode": "none" if NEO4J_AUTH_DISABLED else "password",
+            "llm_provider": _normalize_llm_provider(LLM_PROVIDER),
+            "llm_model": self.model_name,
             "openai_model": self.model_name,
             "counts": self._status_counts(),
         }
@@ -1090,8 +1214,7 @@ class KafkaExpertRuntime:
 
     def __init__(self) -> None:
         """Initialize MCP-backed tools and construct the Kafka expert agent."""
-        if not OPENAI_API_KEY:
-            raise RuntimeError("OPENAI_API_KEY is not configured.")
+        _validate_llm_provider_configuration("Kafka Expert")
 
         self._lock = threading.Lock()
         self._mcp_client = MultiServerMCPClient(
@@ -1121,7 +1244,7 @@ class KafkaExpertRuntime:
         kafka_admin_tools = asyncio.run(self._mcp_client.get_tools(server_name="kafka_admin"))
         tools = [*prometheus_tools, *kafka_admin_tools]
 
-        llm, self.model_name = build_chat_openai_with_fallback("Kafka Expert")
+        llm, self.model_name = build_chat_with_fallback("Kafka Expert")
         self._agent = create_react_agent(model=llm, tools=tools, prompt=SYSTEM_PROMPT)
 
     async def _ask_async(self, user_prompt: str) -> dict[str, Any]:
@@ -1192,7 +1315,7 @@ try:
 except Exception as exc:
     runtime_error = str(exc)
     state.set_status(
-        "Kafka Expert is waiting for model credentials. Set OPENAI_API_KEY and refresh.",
+        "Kafka Expert is waiting for LLM provider configuration. Update LLM_* settings and refresh.",
         error=runtime_error,
     )
 
@@ -1665,7 +1788,7 @@ def index() -> str:
         const r = await fetch('/api/graphrag/ingest_pdf', { method: 'POST', body: formData });
         const data = await r.json();
         if (!data.ok) {
-          appendGraphLog('agent', '1. [BAD] PDF ingest failed. Fix: ' + (data.error || 'check Neo4j/OpenAI and retry.'));
+          appendGraphLog('agent', '1. [BAD] PDF ingest failed. Fix: ' + (data.error || 'check Neo4j and LLM settings and retry.'));
         } else {
           appendGraphLog('agent', data.answer || '1. [GOOD] PDF ingest completed.');
         }
@@ -2019,20 +2142,32 @@ def index() -> str:
 @app.get("/api/health")
 def health() -> Any:
     """Expose runtime health and model configuration visibility for diagnostics."""
+    provider = _normalize_llm_provider(LLM_PROVIDER)
     graph_rt, graph_err = ensure_graph_runtime()
-    effective_model = OPENAI_MODEL
+    requested_model = _requested_model_for_provider(provider)
+    effective_model = requested_model
     if runtime is not None and getattr(runtime, "model_name", ""):
         effective_model = runtime.model_name
     elif graph_rt is not None and getattr(graph_rt, "model_name", ""):
         effective_model = graph_rt.model_name
+    fallback_models = _model_candidates_for_provider(provider)
     return jsonify(
         {
             "ok": runtime is not None,
             "graph_rag_ok": graph_rt is not None,
+            "llm_provider": provider,
+            "llm_model": effective_model,
+            "llm_model_requested": requested_model,
+            "llm_model_fallbacks": fallback_models,
+            "llm_api_key_configured": bool(_llm_api_key_for_provider(provider)),
+            "llm_base_url_configured": bool(_llm_base_url_for_provider(provider)),
+            "llm_base_url": _llm_base_url_for_provider(provider),
             "openai_model": effective_model,
-            "openai_model_requested": OPENAI_MODEL,
-            "openai_model_fallbacks": OPENAI_MODEL_FALLBACKS,
-            "openai_api_key_configured": bool(OPENAI_API_KEY),
+            "openai_model_requested": requested_model,
+            "openai_model_fallbacks": fallback_models,
+            "openai_api_key_configured": bool(_llm_api_key_for_provider(provider)),
+            "openai_base_url_configured": bool(_llm_base_url_for_provider(provider)),
+            "openai_base_url": _llm_base_url_for_provider(provider),
             "prometheus_url": PROMETHEUS_URL,
             "kafka_bootstrap_servers": KAFKA_BOOTSTRAP_SERVERS,
             "schema_registry_url": SCHEMA_REGISTRY_URL,

@@ -97,16 +97,29 @@ Do not run Python scripts directly on host.
 
 ## Quick Start
 1. `cd /Users/paulharvener/workspace/kafka-expert`
-2. Set GenAI credentials in `.env`:
-   - `OPENAI_API_KEY=...`
-   - `OPENAI_MODEL=gpt-5.3` (or another available model in your account)
-   - `OPENAI_MODEL_FALLBACKS=gpt-5.2,gpt-4.1` (used automatically if requested model is unavailable)
-   - Optional: `OPENAI_BASE_URL=...` for OpenAI-compatible gateways
+2. Configure LLM provider in `.env`:
+   - `LLM_PROVIDER=openai|ollama|huggingface` (default `openai`)
+   - `LLM_TEMPERATURE=0` (float)
+   - OpenAI mode:
+     - `OPENAI_API_KEY=...`
+     - `OPENAI_MODEL=gpt-5.3` (or another available model in your account)
+     - `OPENAI_MODEL_FALLBACKS=gpt-5.2,gpt-4.1` (used automatically if requested model is unavailable)
+     - Optional: `OPENAI_BASE_URL=...` for OpenAI-compatible gateways
+   - Ollama mode:
+     - `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` (or internal URL for your setup)
+     - `OLLAMA_MODEL=llama3.1:8b`
+     - `OLLAMA_MODEL_FALLBACKS=llama3.2:3b`
+     - `OLLAMA_API_KEY` optional (placeholder accepted if unset)
+   - Hugging Face mode (OpenAI-compatible endpoint required):
+     - `HUGGINGFACE_OPENAI_BASE_URL=...` (for example provider endpoint URL)
+     - `HUGGINGFACE_API_KEY=...` (if required by endpoint)
+     - `HUGGINGFACE_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct`
+     - `HUGGINGFACE_MODEL_FALLBACKS=meta-llama/Llama-3.2-3B-Instruct`
    - Neo4j Graph RAG credentials:
-     - `NEO4J_USER=neo4j`
-     - `NEO4J_PASSWORD=...`
-     - `NEO4J_AUTH=none` (demo auto-login mode for Neo4j Browser; no username/password prompt)
-     - `NEO4J_BROWSER_PUBLIC_URL=http://localhost:7474/browser/`
+      - `NEO4J_USER=neo4j`
+      - `NEO4J_PASSWORD=...`
+      - `NEO4J_AUTH=none` (demo auto-login mode for Neo4j Browser; no username/password prompt)
+      - `NEO4J_BROWSER_PUBLIC_URL=http://localhost:7474/browser/`
 3. `docker compose up -d --build --remove-orphans`
 4. Open producer UI: `http://localhost:5050`
 5. Open consumer UI: `http://localhost:5051`
@@ -168,9 +181,10 @@ Kafka Expert API endpoints:
   - `POST /api/graphrag/ingest_pdf` ingests one uploaded PDF (`multipart/form-data`, file field `pdf`) into Neo4j and generates entity/relation edges.
   - `POST /api/graphrag/query` answers a graph-grounded question from ingested PDF knowledge.
 - Model selection behavior:
-  - Kafka Expert validates the requested `OPENAI_MODEL` at startup.
-  - If the model is unavailable for the account, it automatically falls back through `OPENAI_MODEL_FALLBACKS`.
-  - `GET /api/health` reports `openai_model_requested`, `openai_model`, and `openai_model_fallbacks`.
+  - Kafka Expert validates the requested model for the selected `LLM_PROVIDER` at startup.
+  - If the requested model is unavailable, it automatically falls back through the provider-specific fallback list.
+  - `GET /api/health` reports `llm_provider`, `llm_model_requested`, `llm_model`, and `llm_model_fallbacks`.
+  - Legacy OpenAI fields (`openai_model*`) are also included for compatibility.
 
 Kafka Expert response formatting and UI behavior:
 - Agent responses are normalized into concise `1.`-based bullets.
@@ -331,8 +345,8 @@ Optional fixed-rate CLI-style producer:
   - `curl -I http://localhost:5051`
   - `curl -I http://localhost:5052`
 - If Kafka Expert shows unavailable runtime:
-  - Verify `OPENAI_API_KEY` is set in `.env`.
-  - Check `curl http://localhost:5052/api/health` for `openai_api_key_configured`.
+  - Verify provider config in `.env` matches the selected `LLM_PROVIDER`.
+  - Check `curl http://localhost:5052/api/health` for `llm_provider`, `llm_model`, and provider configuration flags.
   - Rebuild/restart service: `docker compose up -d --build kafka-expert-ui`
 - If Kafka Expert returns OpenAI `429 insufficient_quota`:
   - Open the OpenAI platform project billing page and check current spend limit / hard cap.
