@@ -1,0 +1,10 @@
+Extract a concise knowledge graph from this text.
+Return JSON only, with this exact schema:
+{"edges":[{"source":"...", "relation":"...", "target":"...", "evidence":"..."}]}
+Rules:
+- Use short entity names.
+- relation should be verb-like snake_case (for example: has_component, uses, stores).
+- Keep max 20 edges.
+- Do not invent facts outside the text.
+Text:
+$chunk_text

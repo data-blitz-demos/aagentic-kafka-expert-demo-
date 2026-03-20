@@ -1,0 +1,16 @@
+Query Prometheus for a full Kafka cluster state assessment.
+Required:
+- Use kafka_cluster_state_snapshot first.
+- If needed, run additional prometheus_query calls for clarification.
+- Determine one overall status: HEALTHY, DEGRADED, or UNHEALTHY.
+- Return:
+  1. Overall status
+  2. Broker-by-broker state
+  3. Key evidence metrics
+  4. Risks or gaps
+  5. Recommended next actions
+Formatting constraints:
+- Must be 1-based numbered bullets only.
+- Keep each bullet concise and easy to understand.
+- Prefix each bullet with `[GOOD]`, `[WARN]`, or `[BAD]`.
+- If a bullet is `[WARN]` or `[BAD]`, include `Fix:` with what to do next.

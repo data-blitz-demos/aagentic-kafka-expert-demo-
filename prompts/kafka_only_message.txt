@@ -1,0 +1,2 @@
+1. [WARN] I can only answer questions about this Kafka cluster and its Prometheus telemetry.
+2. [GOOD] Next step: ask a Kafka-specific question about brokers, topics, partitions, consumer groups, Schema Registry subjects, data contracts, lag, throughput, or health.

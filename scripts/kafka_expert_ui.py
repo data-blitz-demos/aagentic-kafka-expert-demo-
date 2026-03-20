@@ -12,6 +12,8 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
+from string import Template
 import urllib.parse
 import urllib.request
 import uuid
@@ -68,11 +70,22 @@ NEO4J_BROWSER_LOGIN_HINT = (
     else "Login with `NEO4J_USER` and `NEO4J_PASSWORD` from your `.env`."
 )
 GRAPH_RAG_MAX_CHUNKS = int(os.getenv("GRAPH_RAG_MAX_CHUNKS", "20"))
+PROMPT_DIR = Path(__file__).resolve().parents[1] / "prompts"
+
+
+def _load_prompt_template(name: str) -> str:
+    """Load one prompt template from repo-level prompts directory."""
+    path = PROMPT_DIR / name
+    return path.read_text(encoding="utf-8").strip()
+
+
+def render_prompt(name: str, **kwargs: Any) -> str:
+    """Render a string.Template payload so prompts can be updated without code changes."""
+    template = Template(_load_prompt_template(name))
+    return template.safe_substitute(**kwargs)
 
 KAFKA_ONLY_MESSAGE = (
-    "1. [WARN] I can only answer questions about this Kafka cluster and its Prometheus telemetry.\n"
-    "2. [GOOD] Next step: ask a Kafka-specific question about brokers, topics, partitions, consumer groups, "
-    "Schema Registry subjects, data contracts, lag, throughput, or health."
+    _load_prompt_template("kafka_only_message.txt")
 )
 
 KAFKA_TERMS = (
@@ -101,75 +114,11 @@ KAFKA_TERMS = (
     "jmx",
 )
 
-SYSTEM_PROMPT = """You are Kafka Expert, a Kafka-only operations agent.
-Rules:
-1) You must answer only Kafka cluster state, Kafka metrics, Kafka brokers, topics, partitions, replicas, producers, consumers, Schema Registry, or Prometheus telemetry for Kafka.
-2) If a question is not Kafka-related, refuse with a short response.
-3) Tool resources available:
-   - Prometheus MCP telemetry tools (cluster state and health metrics).
-   - Kafka Admin MCP tools (cluster metadata and cluster mutations).
-   - Schema Registry MCP inventory tool.
-4) For cluster state analysis, call Prometheus tools first, especially kafka_cluster_state_snapshot.
-5) For topic inventory/count questions, call kafka_topic_inventory first.
-6) For partition inventory questions, call kafka_partition_inventory.
-7) For consumer-group questions, call kafka_consumer_group_summary and/or Kafka Admin group tools.
-8) For Schema Registry, subjects, and data contract questions, call schema_registry_inventory.
-9) For admin metadata questions (exact topics/partitions/groups), prefer Kafka Admin MCP tools over inferred telemetry.
-10) For cluster mutations (create/delete topic, increase partitions, alter topic configs, delete groups):
-    - Only execute mutation tools when the user explicitly asks for a change.
-    - Do not run destructive operations implicitly.
-    - After each mutation, run a verification read tool and report the post-change state.
-11) Never delete internal topics unless the user explicitly names and requests deletion.
-12) Ground conclusions in queried metrics and cited values.
-13) Keep responses concise and operational: status, evidence, risks, next actions.
-14) Output format is mandatory:
-   - Use only 1-based numbered bullets (`1.`, `2.`, ...).
-   - No markdown headings.
-   - No paragraph prose outside bullets.
-   - Keep 4-6 bullets, one short sentence per bullet.
-   - Use plain language for non-expert readers.
-   - Prefix each bullet with one severity tag: `[GOOD]`, `[WARN]`, or `[BAD]`.
-   - For every `[WARN]` or `[BAD]` bullet, include a short `Fix:` action in the same bullet.
-"""
+SYSTEM_PROMPT = _load_prompt_template("system_prompt.txt")
 
-CLUSTER_STATE_PROMPT = """Query Prometheus for a full Kafka cluster state assessment.
-Required:
-- Use kafka_cluster_state_snapshot first.
-- If needed, run additional prometheus_query calls for clarification.
-- Determine one overall status: HEALTHY, DEGRADED, or UNHEALTHY.
-- Return:
-  1. Overall status
-  2. Broker-by-broker state
-  3. Key evidence metrics
-  4. Risks or gaps
-  5. Recommended next actions
-Formatting constraints:
-- Must be 1-based numbered bullets only.
-- Keep each bullet concise and easy to understand.
-- Prefix each bullet with `[GOOD]`, `[WARN]`, or `[BAD]`.
-- If a bullet is `[WARN]` or `[BAD]`, include `Fix:` with what to do next.
-"""
+CLUSTER_STATE_PROMPT = _load_prompt_template("cluster_state_prompt.txt")
 
-AUTO_FIX_PROMPT_TEMPLATE = """A user clicked a `Fix:` action in Kafka Expert UI.
-
-Issue line:
-{issue_line}
-
-Objective:
-- Attempt to remediate this issue now using all available tools:
-  - Prometheus MCP telemetry tools
-  - Kafka Admin MCP tools (including mutation tools)
-  - Schema Registry MCP inventory tools
-
-Rules:
-1) You have explicit user authorization to attempt this fix.
-2) If mutation is required, perform the smallest safe change and then verify with read tools.
-3) Report concrete evidence after the change attempt (metrics/metadata values).
-4) If full remediation is not possible with available tools/access, explain exactly what remains.
-5) Output only 1-based numbered bullets with `[GOOD]`, `[WARN]`, `[BAD]`.
-6) Include `Fix:` only for unresolved warning/bad bullets.
-7) Keep response concise and operational.
-"""
+AUTO_FIX_PROMPT_TEMPLATE = _load_prompt_template("auto_fix_prompt_template.txt")
 
 TOPIC_INVENTORY_SERIES_PROMQL = (
     'count by (topic) (label_replace('
@@ -923,17 +872,7 @@ class GraphRAGRuntime:
 
     def _extract_edges(self, chunk_text: str) -> list[dict[str, str]]:
         """Extract relation edges from one chunk using deterministic JSON output."""
-        prompt = (
-            "Extract a concise knowledge graph from this text.\n"
-            "Return JSON only, with this exact schema:\n"
-            '{"edges":[{"source":"...", "relation":"...", "target":"...", "evidence":"..."}]}\n'
-            "Rules:\n"
-            "- Use short entity names.\n"
-            "- relation should be verb-like snake_case (for example: has_component, uses, stores).\n"
-            "- Keep max 20 edges.\n"
-            "- Do not invent facts outside the text.\n"
-            f"Text:\n{chunk_text}"
-        )
+        prompt = render_prompt("graphrag_extract_prompt.txt", chunk_text=chunk_text)
         raw = normalize_content(self._llm.invoke(prompt).content).strip()
         payload: dict[str, Any] = {}
         try:
@@ -1139,12 +1078,8 @@ class GraphRAGRuntime:
             context_lines.append(f"- {source} --{relation}--> {target} (weight={weight})")
         graph_context = "\n".join(context_lines)
 
-        prompt = (
-            "You are answering from a Neo4j graph built from PDF knowledge.\n"
-            "Use only the graph context below.\n"
-            "If context is weak, say so.\n"
-            "Output only 1-based bullets with [GOOD]/[WARN]/[BAD].\n\n"
-            f"Question: {question}\n\nGraph context:\n{graph_context}"
+        prompt = render_prompt(
+            "graphrag_query_prompt.txt", question=question, graph_context=graph_context
         )
         answer = normalize_content(self._llm.invoke(prompt).content).strip()
         return to_numbered_bullets(answer)
@@ -2295,7 +2230,7 @@ def api_auto_fix() -> Any:
         return jsonify({"ok": False, "error": err, **state.snapshot()}), 500
 
     try:
-        prompt = AUTO_FIX_PROMPT_TEMPLATE.format(issue_line=issue_line)
+        prompt = Template(AUTO_FIX_PROMPT_TEMPLATE).safe_substitute(issue_line=issue_line)
         answer = runtime.ask(prompt)
         state.add_chat("agent", answer)
         return jsonify({"ok": True, "answer": answer, **state.snapshot()})

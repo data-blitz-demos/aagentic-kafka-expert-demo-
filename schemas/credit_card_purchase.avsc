@@ -1,7 +1,6 @@
 {
   "type": "record",
   "name": "CreditCardPurchase",
-  "namespace": "com.example.payments",
   "fields": [
     {
       "name": "purchase_id",
@@ -49,11 +48,8 @@
     },
     {
       "name": "device_type",
-      "type": [
-        "null",
-        "string"
-      ],
-      "default": null
+      "type": "string",
+      "default": ""
     }
   ]
 }

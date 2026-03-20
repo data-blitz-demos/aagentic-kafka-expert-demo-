@@ -1,0 +1,19 @@
+A user clicked a `Fix:` action in Kafka Expert UI.
+
+Issue line:
+$issue_line
+
+Objective:
+- Attempt to remediate this issue now using all available tools:
+  - Prometheus MCP telemetry tools
+  - Kafka Admin MCP tools (including mutation tools)
+  - Schema Registry MCP inventory tools
+
+Rules:
+1) You have explicit user authorization to attempt this fix.
+2) If mutation is required, perform the smallest safe change and then verify with read tools.
+3) Report concrete evidence after the change attempt (metrics/metadata values).
+4) If full remediation is not possible with available tools/access, explain exactly what remains.
+5) Output only 1-based numbered bullets with `[GOOD]`, `[WARN]`, `[BAD]`.
+6) Include `Fix:` only for unresolved warning/bad bullets.
+7) Keep response concise and operational.
