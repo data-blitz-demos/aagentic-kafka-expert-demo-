@@ -1,0 +1,6 @@
+FROM qwen3:8b
+
+# The Kafka agent system prompt, MCP tool schemas, and tool results exceed
+# Ollama's small default context. Preserve the complete agent loop.
+PARAMETER num_ctx 8192
+PARAMETER temperature 0

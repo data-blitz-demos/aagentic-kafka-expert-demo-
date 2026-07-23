@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV DEEPEVAL_DISABLE_DOTENV=1
+ENV DEEPEVAL_TELEMETRY_OPT_OUT=1
+
+COPY requirements-deepeval.txt /app/requirements-deepeval.txt
+RUN pip install --no-cache-dir -r /app/requirements-deepeval.txt
+
+COPY scripts/deepeval_service.py /app/scripts/deepeval_service.py
+
+CMD ["python", "scripts/deepeval_service.py"]

@@ -57,6 +57,8 @@ def _random_for_type(avro_type: Any, field_name: str = "") -> Any:
                 return str(uuid.uuid4())
             if "time" in field_name:
                 return datetime.now(timezone.utc).isoformat()
+            if field_name == "currency":
+                return random.choice(["USD", "CNY"])
             return f"{field_name or 'value'}-{random.randint(1000, 9999)}"
         if avro_type == "int":
             return random.randint(1, 1000)
@@ -121,6 +123,7 @@ class ProducerService:
         self.sent_count = 0
         self.last_error = ""
         self.last_message: dict[str, Any] | None = None
+        self.last_sent_at = ""
         self._schema_mtime = 0.0
         self._schema_str = ""
         self._schema_dict: dict[str, Any] = {}
@@ -226,6 +229,7 @@ class ProducerService:
             self._producer.flush(10)
             self.sent_count += 1
             self.last_message = message
+            self.last_sent_at = datetime.now(timezone.utc).isoformat()
         return message
 
     def start(self, rate_seconds: float) -> None:
@@ -267,6 +271,8 @@ class ProducerService:
                 "rate_seconds": self.rate_seconds,
                 "sent_count": self.sent_count,
                 "last_error": self.last_error,
+                "last_message": self.last_message,
+                "last_sent_at": self.last_sent_at,
                 "topic": TOPIC,
                 "subject": SUBJECT,
             }
@@ -374,7 +380,11 @@ def index() -> str:
         'Sent: <code>' + s.sent_count + '</code> | ' +
         'Topic: <code>' + s.topic + '</code> | ' +
         'Subject: <code>' + s.subject + '</code> | ' +
+        'Last sent at: <code>' + (s.last_sent_at || 'n/a') + '</code> | ' +
         'Last error: <code>' + (s.last_error || 'none') + '</code>';
+      if (s.last_message) {{
+        document.getElementById('message').textContent = JSON.stringify(s.last_message, null, 2);
+      }}
     }}
 
     async function sendOne() {{

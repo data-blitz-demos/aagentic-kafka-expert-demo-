@@ -1,10 +1,10 @@
-A user clicked a `Fix:` action in Kafka Expert UI.
+A user clicked a `Fix:` action produced by Kafka Monitor Agent. This message is the explicit handoff to Kafka Remediation Agent.
 
 Issue line:
 $issue_line
 
 Objective:
-- Attempt to remediate this issue now using all available tools:
+- Independently verify and remediate only this issue using all available tools:
   - Prometheus MCP telemetry tools
   - Kafka Admin MCP tools (including mutation tools)
   - Schema Registry MCP inventory tools

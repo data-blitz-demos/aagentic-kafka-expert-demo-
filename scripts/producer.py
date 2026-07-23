@@ -20,6 +20,9 @@ from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
 
 
+PURCHASE_CURRENCIES = ["USD", "CNY"]
+
+
 def delivery_report(err, msg) -> None:
     """Log Kafka delivery success/failure for produced records."""
     if err is not None:
@@ -50,7 +53,7 @@ def make_purchase() -> dict:
         "city": random.choice(cities),
         "state": random.choice(states),
         "amount": round(random.uniform(3.5, 1200.0), 2),
-        "currency": "USD",
+        "currency": random.choice(PURCHASE_CURRENCIES),
         "is_card_present": random.choice([True, False]),
     }
 

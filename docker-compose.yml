@@ -16,10 +16,24 @@ x-python-app: &python-app
     COUCHDB_USER: ${COUCHDB_USER}
     COUCHDB_PASSWORD: ${COUCHDB_PASSWORD}
     COUCHDB_DB: ${COUCHDB_DB}
+    COUCHDB_CONTEXT_DB: ${COUCHDB_CONTEXT_DB}
+    CONTEXT_PERSIST_TO_COUCHDB: ${CONTEXT_PERSIST_TO_COUCHDB}
     CONSUMER_WRITE_COUCHDB: ${CONSUMER_WRITE_COUCHDB}
     PROMETHEUS_URL: http://prometheus:9090
     LLM_PROVIDER: ${LLM_PROVIDER}
+    MONITOR_LLM_PROVIDER: ${MONITOR_LLM_PROVIDER:-${LLM_PROVIDER}}
+    MONITOR_MODEL: ${MONITOR_MODEL:-}
+    MONITOR_MODEL_FALLBACKS: ${MONITOR_MODEL_FALLBACKS:-}
+    REMEDIATION_LLM_PROVIDER: ${REMEDIATION_LLM_PROVIDER:-}
     LLM_TEMPERATURE: ${LLM_TEMPERATURE}
+    REMEDIATION_MODEL: ${REMEDIATION_MODEL:-}
+    REMEDIATION_MODEL_FALLBACKS: ${REMEDIATION_MODEL_FALLBACKS:-}
+    A2A_REMEDIATION_BASE_URL: http://kafka-remediation-agent:${KAFKA_REMEDIATION_AGENT_PORT:-5053}/a2a/remediation
+    A2A_REMEDIATION_PUBLIC_URL: http://localhost:${KAFKA_REMEDIATION_AGENT_PORT:-5053}/a2a/remediation
+    A2A_REMEDIATION_HEALTH_URL: http://kafka-remediation-agent:${KAFKA_REMEDIATION_AGENT_PORT:-5053}/api/health
+    A2A_REMEDIATION_TOKEN: ${A2A_REMEDIATION_TOKEN:-kafka-demo-a2a-token}
+    DEEPEVAL_URL: http://deepeval:${DEEPEVAL_SERVICE_PORT:-5060}
+    DEEPEVAL_AUTO_EVALUATE: ${DEEPEVAL_AUTO_EVALUATE:-true}
     OPENAI_API_KEY: ${OPENAI_API_KEY}
     OPENAI_BASE_URL: ${OPENAI_BASE_URL}
     OPENAI_MODEL: ${OPENAI_MODEL}
@@ -28,12 +42,14 @@ x-python-app: &python-app
     OLLAMA_API_KEY: ${OLLAMA_API_KEY}
     OLLAMA_MODEL: ${OLLAMA_MODEL}
     OLLAMA_MODEL_FALLBACKS: ${OLLAMA_MODEL_FALLBACKS}
+    OLLAMA_MODELS_DIR: ${OLLAMA_MODELS_DIR}
     HUGGINGFACE_OPENAI_BASE_URL: ${HUGGINGFACE_OPENAI_BASE_URL}
     HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY}
     HUGGINGFACE_MODEL: ${HUGGINGFACE_MODEL}
     HUGGINGFACE_MODEL_FALLBACKS: ${HUGGINGFACE_MODEL_FALLBACKS}
     NEO4J_BROWSER_PUBLIC_URL: ${NEO4J_BROWSER_PUBLIC_URL}
     KAFKA_EXPERT_UI_PORT: ${KAFKA_EXPERT_UI_PORT}
+    KAFKA_REMEDIATION_AGENT_PORT: ${KAFKA_REMEDIATION_AGENT_PORT:-5053}
     NEO4J_URI: bolt://neo4j:7687
     NEO4J_USERNAME: ${NEO4J_USER}
     NEO4J_PASSWORD: ${NEO4J_PASSWORD}
@@ -43,8 +59,75 @@ x-python-app: &python-app
     - ./schemas:/app/schemas
     - ./output:/app/output
     - ./prompts:/app/prompts:ro
+    - ${OLLAMA_HOST_MODELS_DIR}:/root/.ollama/models:ro
 
 services:
+  deepeval:
+    build:
+      context: .
+      dockerfile: Dockerfile.deepeval
+    environment:
+      DEEPEVAL_SERVICE_PORT: ${DEEPEVAL_SERVICE_PORT:-5060}
+      DEEPEVAL_JUDGE_MODEL: ${DEEPEVAL_JUDGE_MODEL:-}
+      DEEPEVAL_JUDGE_PROVIDER: ${DEEPEVAL_JUDGE_PROVIDER:-${LLM_PROVIDER}}
+      DEEPEVAL_THRESHOLD: ${DEEPEVAL_THRESHOLD:-0.7}
+      DEEPEVAL_MAX_HISTORY: ${DEEPEVAL_MAX_HISTORY:-20}
+      DEEPEVAL_DISABLE_DOTENV: "1"
+      DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+      LLM_PROVIDER: ${LLM_PROVIDER}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
+      OPENAI_MODEL: ${OPENAI_MODEL}
+      OPENAI_MODEL_FALLBACKS: ${OPENAI_MODEL_FALLBACKS}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      OLLAMA_MODEL_FALLBACKS: ${OLLAMA_MODEL_FALLBACKS}
+      HUGGINGFACE_OPENAI_BASE_URL: ${HUGGINGFACE_OPENAI_BASE_URL}
+      HUGGINGFACE_API_KEY: ${HUGGINGFACE_API_KEY}
+      HUGGINGFACE_MODEL: ${HUGGINGFACE_MODEL}
+      HUGGINGFACE_MODEL_FALLBACKS: ${HUGGINGFACE_MODEL_FALLBACKS}
+    ports:
+      - "${DEEPEVAL_SERVICE_PORT:-5060}:${DEEPEVAL_SERVICE_PORT:-5060}"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,os,urllib.request; port=os.getenv('DEEPEVAL_SERVICE_PORT','5060'); assert json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/health'))['ok']"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    hostname: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ${OLLAMA_HOST_MODELS_DIR}:/root/.ollama/models
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  ollama-model-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["create", "kafka-qwen3:8b", "-f", "/config/Modelfile.kafka-qwen3"]
+    volumes:
+      - ${OLLAMA_HOST_MODELS_DIR}:/root/.ollama/models
+      - ./ollama/Modelfile.kafka-qwen3:/config/Modelfile.kafka-qwen3:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   couchdb:
     image: couchdb:3.3
     container_name: couchdb
@@ -317,9 +400,27 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  kafka-remediation-agent:
+    <<: *python-app
+    command: ["sh", "-c", "KAFKA_AGENT_PROCESS_ROLE=remediation exec python scripts/kafka_expert_ui.py"]
+    ports:
+      - "${KAFKA_REMEDIATION_AGENT_PORT:-5053}:${KAFKA_REMEDIATION_AGENT_PORT:-5053}"
+    depends_on:
+      prometheus:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json,os,urllib.request; port=os.getenv('KAFKA_REMEDIATION_AGENT_PORT','5053'); assert json.load(urllib.request.urlopen(f'http://127.0.0.1:{port}/api/health'))['remediation_agent_ok']"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
   kafka-expert-ui:
     <<: *python-app
-    command: ["python", "scripts/kafka_expert_ui.py"]
+    command: ["sh", "-c", "KAFKA_AGENT_PROCESS_ROLE=monitor exec python scripts/kafka_expert_ui.py"]
     ports:
       - "${KAFKA_EXPERT_UI_PORT}:${KAFKA_EXPERT_UI_PORT}"
     depends_on:
@@ -327,6 +428,12 @@ services:
         condition: service_started
       neo4j:
         condition: service_started
+      ollama:
+        condition: service_healthy
+      kafka-remediation-agent:
+        condition: service_healthy
+      deepeval:
+        condition: service_healthy
     restart: unless-stopped
 
   producer-rate:

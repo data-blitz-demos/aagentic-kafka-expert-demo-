@@ -26,6 +26,10 @@ Set up a Docker Compose-based Confluent Kafka cluster compatible with local deve
 - Prometheus access exposed to agent through MCP tools
 - Kafka Admin access exposed to agent through MCP tools for metadata and cluster mutations
 - Kafka-only chatbot behavior and cluster-state assessment workflow
+- Two-agent operations flow: read-only Monitor Agent and repair-only Remediation Agent
+- A2A 1.0 HTTP+JSON handoff from clicked `Fix:` findings to the Remediation Agent
+- Separate Docker processes for the Monitor Agent (`:5052`) and Remediation Agent (`:5053`)
+- Local DeepEval judge process (`:5060`) observing and scoring both agent outputs
 - All executables run via Docker Compose services only
 
 ## Artifacts Created
@@ -77,6 +81,10 @@ Ports:
   - `7687` (bolt)
 - Kafka Expert UI:
   - `5052`
+- Kafka Remediation Agent:
+  - `5053`
+- DeepEval judge:
+  - `5060`
 
 ### 2) Environment file
 Created:
@@ -116,6 +124,17 @@ Values:
 - `NEO4J_AUTH=none` (demo auto-login mode; disables Neo4j credential prompts)
 - `NEO4J_BROWSER_PUBLIC_URL=http://localhost:7474/browser/`
 - `GRAPH_RAG_MAX_CHUNKS=20`
+- `DEEPEVAL_SERVICE_PORT=5060`
+- `DEEPEVAL_JUDGE_MODEL=` (blank uses the selected provider model with fallbacks)
+- `DEEPEVAL_JUDGE_PROVIDER=` (blank uses `LLM_PROVIDER`)
+- `MONITOR_LLM_PROVIDER=` (blank uses `LLM_PROVIDER`)
+- `MONITOR_MODEL=` (blank uses the selected provider model)
+- `MONITOR_MODEL_FALLBACKS=`
+- `REMEDIATION_LLM_PROVIDER=` (blank uses `LLM_PROVIDER`)
+- `REMEDIATION_MODEL=` (blank uses the selected provider model)
+- `REMEDIATION_MODEL_FALLBACKS=`
+- `DEEPEVAL_THRESHOLD=0.7`
+- `DEEPEVAL_AUTO_EVALUATE=true`
 
 ### 3) Avro schema
 Created:
@@ -141,6 +160,9 @@ Created:
 - `/Users/paulharvener/workspace/kafka-expert/scripts/kafka_admin_mcp_server.py`
 - `/Users/paulharvener/workspace/kafka-expert/scripts/kafka_expert_ui.py`
 - `/Users/paulharvener/workspace/kafka-expert/requirements.txt`
+- `/Users/paulharvener/workspace/demos/agentic-kafka-expert-demo/scripts/deepeval_service.py`
+- `/Users/paulharvener/workspace/demos/agentic-kafka-expert-demo/Dockerfile.deepeval`
+- `/Users/paulharvener/workspace/demos/agentic-kafka-expert-demo/requirements-deepeval.txt`
 
 Responsibilities:
 - `register_schema.py`
@@ -199,9 +221,11 @@ Responsibilities:
   - Supports cluster metadata introspection (`kafka_describe_cluster`)
 - `kafka_expert_ui.py`
   - Serves Kafka Expert UI at `http://localhost:5052`
-  - Uses LangChain agent with MCP-backed Prometheus + Kafka Admin tools for reasoning and actions
+  - Uses an isolated read-only Monitor Agent process and a separate Remediation Agent process
+  - Sends approved monitor findings to the Remediation Agent with A2A 1.0 `POST /message:send`
+  - Publishes the Remediation Agent Card at `GET /.well-known/agent-card.json`
   - Provides `Query Full Cluster State` action writing assessment to status panel
-  - Provides seven UI tabs: `Kafka Expert`, `Graph RAG`, `Kafka Producer`, `Kafka Consumer`, `Grafana`, `Neo4j Browser`, and `Kafka UI`
+  - Provides ten UI tabs, including `Kafka Expert`, `LLM`, `DeepEval Judge`, `Graph RAG`, producer/consumer views, and operations dashboards
   - Adds Neo4j Graph RAG workflow:
     - upload PDF
     - extract entity/relation edges with LLM
@@ -213,6 +237,11 @@ Responsibilities:
   - Launches Neo4j Browser in a new browser tab from `Neo4j Browser` tab (not iframe) because Neo4j Browser sets `X-Frame-Options: DENY` and `frame-ancestors 'none'`
   - Supports Neo4j Browser auto-login UX in demo mode (`NEO4J_AUTH=none`) so end users are not prompted for username/password
   - Launches Kafka UI in a new browser tab (not iframe) because Kafka UI sets `X-Frame-Options: DENY`
+- `deepeval_service.py`
+  - Runs a local HTTP evaluation service in its own Docker Compose runtime
+  - Uses DeepEval Answer Relevancy and G-Eval Kafka Operational Quality metrics
+  - Accepts Monitor, Remediation, or combined cases and retains recent results in memory
+  - Uses the configured OpenAI-compatible provider and model fallback list for judge inference
   - Provides Kafka-only chatbot and refuses non-Kafka questions
   - Handles explicit create-topic requests deterministically (e.g., `add kafka topic called sally`) using Kafka Admin and immediate metadata verification
   - Normalizes outputs into concise `1.`-based bullets with `[GOOD]`, `[WARN]`, `[BAD]` tags
@@ -629,7 +658,8 @@ Verified:
   - `consumer-ui`
   - `producer-ui`
   - `kafka-expert-ui`
+  - `kafka-remediation-agent`
   - `producer-rate` (optional profile)
-- MCP tool servers run as internal subprocesses of `kafka-expert-ui` (not separate host-executed processes):
+- MCP tool servers run as role-specific subprocesses inside the monitor and remediation containers:
   - `prometheus_mcp_server.py`
   - `kafka_admin_mcp_server.py`
