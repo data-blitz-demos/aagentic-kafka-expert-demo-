@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
+"""Main Flask UI and orchestration runtime for the Agentic Kafka demo.
+
+Owns the Monitor/Doer browser panels, agent APIs, prompt loading, LLM
+configuration, Graph RAG, A2A/HITL workflows, observability, and MLX
+fine-tuning preparation/job controls.
 """
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import asyncio
 import base64
+import html
 import io
 import json
 import os
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -25,6 +31,7 @@ from typing import Any
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from langchain_core.messages import AIMessage
+from langchain_core.tools import StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -32,12 +39,30 @@ from langgraph.prebuilt import create_react_agent
 from neo4j import GraphDatabase
 from pypdf import PdfReader
 from agent_llm_config import resolve_agent_models, resolve_agent_provider
+from graph_ingest_utils import fallback_graph_edges
 from kafka_a2a import PROTOCOL_VERSION as KAFKA_A2A_PROTOCOL_VERSION
+from kafka_a2a import extract_task_update as extract_kafka_a2a_task_update
+from kafka_a2a import get_task as get_kafka_a2a_task
 from kafka_a2a import send_message as send_kafka_a2a_message
-from kafka_agent_tools import select_kafka_admin_tools
+from kafka_agent_tools import select_kafka_admin_tools, select_kafka_rest_tools
+from monitor_handoff import build_monitor_handoff
+from neo4j_agent_rag import retrieve_neo4j_knowledge
+from remediation_hitl import (
+    COMPLETED as HITL_COMPLETED,
+    FAILED as HITL_FAILED,
+    INPUT_REQUIRED as HITL_INPUT_REQUIRED,
+    REJECTED as HITL_REJECTED,
+    WORKING as HITL_WORKING,
+    RemediationHitlStore,
+    build_review_context,
+    format_human_plan,
+)
+from mlx_finetuning import build_mlx_lora_args, build_mlx_lora_command, estimate_mlx_duration, mlx_runtime_status
 
 
 load_dotenv()
+
+FINETUNING_JOBS: dict[str, dict[str, Any]] = {}
 
 
 def _split_csv(value: str) -> list[str]:
@@ -65,6 +90,12 @@ A2A_REMEDIATION_HEALTH_URL = os.getenv(
 ).strip()
 A2A_REMEDIATION_TOKEN = os.getenv("A2A_REMEDIATION_TOKEN", "").strip() or uuid.uuid4().hex
 A2A_REQUEST_TIMEOUT_SECONDS = float(os.getenv("A2A_REQUEST_TIMEOUT_SECONDS", "120"))
+REMEDIATION_HITL_ENABLED = os.getenv("REMEDIATION_HITL_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 DEEPEVAL_URL = os.getenv("DEEPEVAL_URL", "http://deepeval:5060").strip().rstrip("/")
 DEEPEVAL_AUTO_EVALUATE = os.getenv("DEEPEVAL_AUTO_EVALUATE", "true").strip().lower() in {
     "1",
@@ -139,6 +170,16 @@ NEO4J_BROWSER_LOGIN_HINT = (
     else "Login with `NEO4J_USER` and `NEO4J_PASSWORD` from your `.env`."
 )
 GRAPH_RAG_MAX_CHUNKS = int(os.getenv("GRAPH_RAG_MAX_CHUNKS", "20"))
+GRAPH_RAG_EXTRACT_MAX_TOKENS = max(
+    64, int(os.getenv("GRAPH_RAG_EXTRACT_MAX_TOKENS", "320"))
+)
+GRAPH_RAG_LLM_TIMEOUT_SECONDS = max(
+    10.0, float(os.getenv("GRAPH_RAG_LLM_TIMEOUT_SECONDS", "30"))
+)
+GRAPH_RAG_MAX_EDGES_PER_CHUNK = max(
+    1, int(os.getenv("GRAPH_RAG_MAX_EDGES_PER_CHUNK", "8"))
+)
+MLX_TRAINING_DATA_DIR = os.getenv("MLX_TRAINING_DATA_DIR", "output/fine-tuning").strip() or "output/fine-tuning"
 try:
     AI_TOKEN_BUDGET = max(1, int((os.getenv("AI_TOKEN_BUDGET", "250000") or "250000").strip()))
 except Exception:
@@ -712,6 +753,20 @@ KAFKA_TERMS = (
 SYSTEM_PROMPT = _load_prompt_template("system_prompt.txt")
 
 REMEDIATION_SYSTEM_PROMPT = _load_prompt_template("remediation_system_prompt.txt")
+
+REMEDIATION_PLANNING_SYSTEM_PROMPT = (
+    "You are the non-mutating planning phase of the Kafka Remediation Agent. "
+    "Write for a human operator deciding whether to authorize execution. "
+    "Do not call tools and do not claim that verification or mutation has occurred. "
+        "Start with one sentence describing the intended outcome. Then produce concise numbered steps. "
+        "When more than one safe repair is plausible, present 2-5 distinct suggested repair paths "
+        "that an operator can choose between, with the evidence and risk for each. "
+        "Label every step READ ONLY or CONDITIONAL MUTATION. State the evidence to inspect, "
+    "the exact smallest conditional change that may be attempted, its blast radius and risk, "
+    "rollback instructions, and measurable post-change success criteria. "
+    "If the evidence cannot yet justify a mutation, say that approval authorizes verification "
+    "but does not require a change."
+)
 
 CLUSTER_STATE_PROMPT = _load_prompt_template("cluster_state_prompt.txt")
 
@@ -1617,7 +1672,7 @@ def remediation_llm_config_url() -> str:
 
 def queue_deepeval_observation(agent_role: str, input_text: str, actual_output: str) -> None:
     """Evaluate one live agent response asynchronously so user requests are not blocked by the judge."""
-    if not DEEPEVAL_AUTO_EVALUATE or AGENT_PROCESS_ROLE != "monitor":
+    if not DEEPEVAL_AUTO_EVALUATE or AGENT_PROCESS_ROLE not in {"monitor", "remediation"}:
         return
 
     def _run() -> None:
@@ -1733,6 +1788,10 @@ def to_numbered_bullets(text: str, max_items: int = 6) -> str:
     return "\n".join(out_lines)
 
 
+class GraphIngestCanceled(RuntimeError):
+    """Raised between chunks when a user cancels asynchronous graph ingestion."""
+
+
 class GraphRAGRuntime:
     """Neo4j-backed PDF Graph RAG runtime for knowledge graph ingest and graph-grounded QA."""
 
@@ -1804,21 +1863,58 @@ class GraphRAGRuntime:
         out = out.strip("`\"' ")
         return out[:max_len]
 
-    def _extract_edges(self, chunk_text: str) -> list[dict[str, str]]:
-        """Extract relation edges from one chunk using deterministic JSON output."""
+    def _extract_edges(self, chunk_text: str) -> tuple[list[dict[str, str]], str, str]:
+        """Extract edges with a bounded LLM call and deterministic timeout fallback."""
         prompt = render_prompt("graphrag_extract_prompt.txt", chunk_text=chunk_text)
-        raw = normalize_content(self._llm.invoke(prompt).content).strip()
+        try:
+            worker_env = dict(os.environ)
+            worker_env["GRAPH_RAG_WORKER_API_KEY"] = _llm_api_key_for_provider(LLM_PROVIDER)
+            completed = subprocess.run(
+                ["python", "/app/scripts/graphrag_extract_worker.py"],
+                input=json.dumps(
+                    {
+                        "provider": _normalize_llm_provider(LLM_PROVIDER),
+                        "model": self.model_name,
+                        "base_url": _llm_base_url_for_provider(LLM_PROVIDER),
+                        "temperature": LLM_TEMPERATURE,
+                        "max_tokens": GRAPH_RAG_EXTRACT_MAX_TOKENS,
+                        "prompt": prompt,
+                    }
+                ),
+                text=True,
+                capture_output=True,
+                timeout=GRAPH_RAG_LLM_TIMEOUT_SECONDS,
+                check=False,
+                env=worker_env,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(completed.stderr.strip() or "Graph extraction worker failed.")
+            worker_payload = json.loads(completed.stdout)
+            raw = str(worker_payload.get("content", "")).strip()
+        except Exception as exc:
+            return (
+                fallback_graph_edges(chunk_text, max_edges=GRAPH_RAG_MAX_EDGES_PER_CHUNK),
+                "deterministic_fallback",
+                str(exc),
+            )
         payload: dict[str, Any] = {}
         try:
             payload = json.loads(raw)
         except Exception:
             match = re.search(r"\{[\s\S]*\}", raw)
             if match:
-                payload = json.loads(match.group(0))
+                try:
+                    payload = json.loads(match.group(0))
+                except Exception:
+                    payload = {}
 
         raw_edges = payload.get("edges", []) if isinstance(payload, dict) else []
         if not isinstance(raw_edges, list):
-            return []
+            return (
+                fallback_graph_edges(chunk_text, max_edges=GRAPH_RAG_MAX_EDGES_PER_CHUNK),
+                "deterministic_fallback",
+                "The extraction LLM returned an invalid edges payload.",
+            )
 
         dedupe: set[tuple[str, str, str]] = set()
         edges: list[dict[str, str]] = []
@@ -1844,11 +1940,23 @@ class GraphRAGRuntime:
                     "evidence": evidence,
                 }
             )
-            if len(edges) >= 20:
+            if len(edges) >= GRAPH_RAG_MAX_EDGES_PER_CHUNK:
                 break
-        return edges
+        if edges:
+            return edges, "llm", ""
+        return (
+            fallback_graph_edges(chunk_text, max_edges=GRAPH_RAG_MAX_EDGES_PER_CHUNK),
+            "deterministic_fallback",
+            "The extraction LLM returned no valid edges.",
+        )
 
-    def ingest_pdf(self, filename: str, pdf_bytes: bytes) -> dict[str, Any]:
+    def ingest_pdf(
+        self,
+        filename: str,
+        pdf_bytes: bytes,
+        progress_callback: Any = None,
+        should_cancel: Any = None,
+    ) -> dict[str, Any]:
         """Ingest one PDF file into Neo4j and create entity/relation edges."""
         if not pdf_bytes:
             raise ValueError("PDF payload is empty.")
@@ -1860,9 +1968,14 @@ class GraphRAGRuntime:
         if not chunks:
             raise ValueError("Unable to create text chunks from PDF.")
         limited_chunks = chunks[: max(1, GRAPH_RAG_MAX_CHUNKS)]
+        if progress_callback:
+            progress_callback(0, len(limited_chunks), phase="preparing")
 
         doc_id = str(uuid.uuid4())
         total_edges = 0
+        fallback_chunks = 0
+        llm_enabled = True
+        last_fallback_reason = ""
         with self._lock:
             with self._driver.session() as session:
                 session.run(
@@ -1877,7 +1990,31 @@ class GraphRAGRuntime:
                 ).consume()
 
                 for idx, chunk_text in enumerate(limited_chunks):
-                    edges = self._extract_edges(chunk_text)
+                    if should_cancel and should_cancel():
+                        raise GraphIngestCanceled("Graph ingestion canceled by the user.")
+                    if progress_callback:
+                        progress_callback(
+                            idx,
+                            len(limited_chunks),
+                            phase="extracting",
+                            current_chunk=idx + 1,
+                            extraction_mode="llm" if llm_enabled else "deterministic_fallback",
+                        )
+                    if llm_enabled:
+                        edges, extraction_mode, fallback_reason = self._extract_edges(chunk_text)
+                        if extraction_mode != "llm":
+                            llm_enabled = False
+                            last_fallback_reason = fallback_reason
+                    else:
+                        edges = fallback_graph_edges(
+                            chunk_text,
+                            max_edges=GRAPH_RAG_MAX_EDGES_PER_CHUNK,
+                        )
+                        extraction_mode = "deterministic_fallback"
+                    if should_cancel and should_cancel():
+                        raise GraphIngestCanceled("Graph ingestion canceled by the user.")
+                    if extraction_mode != "llm":
+                        fallback_chunks += 1
                     total_edges += len(edges)
                     chunk_id = f"{doc_id}:{idx}"
                     session.run(
@@ -1904,12 +2041,25 @@ class GraphRAGRuntime:
                             "edges": edges,
                         },
                     ).consume()
+                    if progress_callback:
+                        progress_callback(
+                            idx + 1,
+                            len(limited_chunks),
+                            phase="persisted",
+                            current_chunk=idx + 1,
+                            extraction_mode=extraction_mode,
+                            edges_created=total_edges,
+                            fallback_chunks=fallback_chunks,
+                            fallback_reason=last_fallback_reason,
+                        )
 
         return {
             "doc_id": doc_id,
             "source_file": filename,
             "chunks_processed": len(limited_chunks),
             "edges_created": total_edges,
+            "fallback_chunks": fallback_chunks,
+            "extraction_mode": "llm" if fallback_chunks == 0 else "hybrid_fallback",
         }
 
     def _status_counts(self) -> dict[str, int]:
@@ -2124,16 +2274,51 @@ class KafkaExpertRuntime:
                         "MCP_TRANSPORT": "stdio",
                     },
                 },
+                "kafka_rest": {
+                    "transport": "stdio",
+                    "command": "python",
+                    "args": ["/app/scripts/kafka_rest_mcp_server.py"],
+                    "env": {
+                        "KAFKA_REST_PROXY_URL": os.getenv("KAFKA_REST_PROXY_URL", "http://kafka-rest-proxy:8082"),
+                        "MCP_TRANSPORT": "stdio",
+                    },
+                },
             }
         )
         prometheus_tools = asyncio.run(self._mcp_client.get_tools(server_name="prometheus"))
         kafka_admin_tools = asyncio.run(self._mcp_client.get_tools(server_name="kafka_admin"))
+        kafka_rest_tools = asyncio.run(self._mcp_client.get_tools(server_name="kafka_rest"))
+
+        def neo4j_graph_rag_search(question: str) -> dict[str, Any]:
+            """Search PDF-derived Kafka knowledge in Neo4j for causes, risks, and repair guidance."""
+            return retrieve_neo4j_knowledge(
+                question,
+                uri=NEO4J_URI,
+                username=NEO4J_USERNAME,
+                password=NEO4J_PASSWORD,
+                auth_disabled=NEO4J_AUTH_DISABLED,
+            )
+
+        graph_rag_tool = StructuredTool.from_function(
+            func=neo4j_graph_rag_search,
+            name="neo4j_graph_rag_search",
+            description=(
+                "Search the shared Neo4j Graph RAG knowledge built from ingested Kafka PDFs. "
+                "Use it for failure causes, operational risks, and remediation guidance; verify "
+                "live cluster state with Prometheus or Kafka Admin tools."
+            ),
+        )
         tools = [
             *prometheus_tools,
             *select_kafka_admin_tools(
                 kafka_admin_tools,
                 allow_mutations=agent_role == "remediation",
             ),
+            *select_kafka_rest_tools(
+                kafka_rest_tools,
+                allow_mutations=agent_role == "remediation",
+            ),
+            graph_rag_tool,
         ]
         self._tools_by_name = {tool.name: tool for tool in tools}
 
@@ -2197,6 +2382,27 @@ class KafkaExpertRuntime:
         """Run one agent turn and return normalized response text."""
         answer, _trace = self.ask_with_trace(user_prompt, thread_id=thread_id)
         return answer
+
+    def plan_with_trace(self, user_prompt: str) -> tuple[str, dict[str, Any]]:
+        """Draft a repair plan without exposing tools or performing mutations."""
+        with self._lock:
+            started = time.time()
+            response = self._llm.bind(max_tokens=450).invoke(
+                [("system", REMEDIATION_PLANNING_SYSTEM_PROMPT), ("user", user_prompt)]
+            )
+            duration_ms = int((time.time() - started) * 1000)
+        result = {"messages": [response]}
+        plan = format_human_plan(extract_ai_text(result))
+        trace = build_agent_trace(
+            prompt_source="a2a_remediation_plan",
+            agent_role=self.agent_role,
+            system_prompt_file="inline:hitl_planning",
+            system_prompt=REMEDIATION_PLANNING_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            agent_result=result,
+            duration_ms=duration_ms,
+        )
+        return plan, trace
 
     async def _cluster_state_grounded_async(self) -> tuple[Any, Any]:
         """Fetch the required snapshot first, then ask the model to interpret verified evidence."""
@@ -2631,11 +2837,19 @@ state = AppState(
         else f"{AppState.DOC_ID}::remediation"
     ),
 )
+remediation_hitl = RemediationHitlStore(enabled=REMEDIATION_HITL_ENABLED)
+cluster_state_lock = threading.Lock()
+cluster_state_running = False
+completed_a2a_tasks: set[str] = set()
+completed_a2a_tasks_lock = threading.Lock()
+pending_a2a_prompts: dict[str, str] = {}
 runtime: KafkaExpertRuntime | None = None
 runtime_error = ""
 remediation_runtime: KafkaExpertRuntime | None = None
 remediation_runtime_error = ""
 graph_runtime: GraphRAGRuntime | None = None
+GRAPH_INGEST_JOBS: dict[str, dict[str, Any]] = {}
+GRAPH_INGEST_JOBS_LOCK = threading.Lock()
 graph_runtime_error = ""
 graph_runtime_lock = threading.Lock()
 runtime_reconfig_lock = threading.Lock()
@@ -2673,12 +2887,15 @@ else:
             error=remediation_runtime_error,
         )
 
+    try:
+        graph_runtime = GraphRAGRuntime()
+    except Exception as exc:
+        graph_runtime_error = str(exc)
+
 
 def ensure_graph_runtime() -> tuple[GraphRAGRuntime | None, str]:
     """Lazily initialize Graph RAG runtime so startup ordering doesn't block Neo4j usage."""
     global graph_runtime, graph_runtime_error
-    if AGENT_PROCESS_ROLE != "monitor":
-        return None, "Graph RAG is disabled in the remediation runtime."
     if graph_runtime is not None:
         return graph_runtime, ""
 
@@ -3005,6 +3222,213 @@ def index() -> str:
       font-size: 13px;
       line-height: 1.4;
     }
+    .hitl-panel {
+      margin: 12px 0;
+      border: 1px solid #486274;
+      border-radius: 12px;
+      background: #0d1821;
+      padding: 14px;
+    }
+    .hitl-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .hitl-header h3 { margin: 0 0 4px 0; }
+    .hitl-mode {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .hitl-switch {
+      position: relative;
+      display: inline-block;
+      width: 48px;
+      height: 26px;
+    }
+    .hitl-switch input {
+      width: 0;
+      height: 0;
+      opacity: 0;
+    }
+    .hitl-slider {
+      position: absolute;
+      inset: 0;
+      cursor: pointer;
+      border-radius: 999px;
+      background: #405261;
+      transition: 160ms ease;
+    }
+    .hitl-slider::before {
+      content: "";
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      left: 3px;
+      top: 3px;
+      border-radius: 50%;
+      background: #f2f7fa;
+      transition: 160ms ease;
+    }
+    .hitl-switch input:checked + .hitl-slider { background: #0d9b74; }
+    .hitl-switch input:checked + .hitl-slider::before { transform: translateX(22px); }
+    .hitl-task {
+      margin-top: 12px;
+      border: 1px solid #355063;
+      border-radius: 10px;
+      background: #111f2a;
+      padding: 12px;
+    }
+    .hitl-task-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+      font-size: 12px;
+      color: var(--ink-dim);
+    }
+    .hitl-review-prompt {
+      border: 1px solid #a16207;
+      border-radius: 10px;
+      background: #2b1d07;
+      padding: 12px;
+      margin-bottom: 12px;
+    }
+    .hitl-review-prompt h4 {
+      margin: 0 0 8px 0;
+      color: #fde68a;
+      font-size: 16px;
+    }
+    .hitl-review-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 8px;
+    }
+    .hitl-review-item {
+      border: 1px solid #5e481c;
+      border-radius: 8px;
+      background: #1c160b;
+      padding: 9px;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .hitl-review-item strong {
+      display: block;
+      margin-bottom: 4px;
+      color: #fef3c7;
+    }
+    .hitl-what-wrong {
+      border: 1px solid #b45309;
+      border-radius: 9px;
+      background: #211507;
+      color: #ffedd5;
+      padding: 11px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+    .hitl-fix-options {
+      display: grid;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .hitl-fix-option {
+      display: flex;
+      align-items: flex-start;
+      gap: 9px;
+      width: 100%;
+      border: 1px solid #386078;
+      border-radius: 8px;
+      background: #102431;
+      color: #d9edf7;
+      padding: 10px;
+      text-align: left;
+      cursor: pointer;
+      font: inherit;
+      line-height: 1.4;
+    }
+    .hitl-fix-option:hover { border-color: #38bdf8; background: #15364a; }
+    .hitl-fix-option:disabled { opacity: 0.6; cursor: wait; }
+    .hitl-fix-number { color: #7dd3fc; font-weight: 800; min-width: 22px; }
+    .hitl-badge {
+      border-radius: 999px;
+      padding: 4px 8px;
+      border: 1px solid #a16207;
+      background: #422006;
+      color: #fde68a;
+      font-weight: 700;
+    }
+    .hitl-badge.working { border-color: #2563eb; background: #172554; color: #bfdbfe; }
+    .hitl-badge.completed { border-color: #15803d; background: #052e16; color: #bbf7d0; }
+    .hitl-badge.rejected,
+    .hitl-badge.failed { border-color: #991b1b; background: #450a0a; color: #fecaca; }
+    .hitl-block-label {
+      margin: 9px 0 5px;
+      color: #9fc5db;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+      text-transform: uppercase;
+    }
+    .hitl-block {
+      margin: 0;
+      max-height: 230px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border: 1px solid #2e4657;
+      border-radius: 8px;
+      background: #09131b;
+      color: #d9edf7;
+      padding: 10px;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .hitl-decision-row {
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) auto auto;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .hitl-note {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: #0e1821;
+      color: var(--ink);
+    }
+    .hitl-context-details {
+      margin-top: 10px;
+      border: 1px solid #355063;
+      border-radius: 8px;
+      background: #0b151d;
+      overflow: hidden;
+    }
+    .hitl-context-details summary {
+      cursor: pointer;
+      padding: 10px;
+      color: #9fc5db;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .hitl-context-details[open] summary {
+      border-bottom: 1px solid #355063;
+    }
+    .hitl-context-details .hitl-block {
+      max-height: 520px;
+      border: 0;
+      border-radius: 0;
+    }
+    button.hitl-reject { background: #7f1d1d; }
+    .hitl-empty {
+      margin: 12px 0 0;
+      color: var(--ink-dim);
+      font-size: 13px;
+    }
     .chat-input-row { display: flex; gap: 8px; }
     #chatInput {
       flex: 1;
@@ -3155,6 +3579,33 @@ def index() -> str:
       font-size: 13px;
       margin-bottom: 8px;
     }
+    .finetune-card {
+      border: 1px solid #355063;
+      border-radius: 10px;
+      background: #0f1a24;
+      padding: 14px;
+      margin-bottom: 10px;
+    }
+    .finetune-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin: 10px 0;
+    }
+    .finetune-grid label { display: grid; gap: 5px; color: var(--ink-dim); font-size: 12px; }
+    .finetune-grid input, .finetune-grid select {
+      border: 1px solid var(--line); border-radius: 8px; padding: 9px;
+      background: #0e1821; color: var(--ink);
+    }
+    .finetune-status { border: 1px solid #516273; border-radius: 9px; padding: 11px 13px; margin: 10px 0; font-weight: 600; }
+    .finetune-status.available { border-color: #2f9e68; background: rgba(47, 158, 104, 0.14); color: #8ff0b9; }
+    .finetune-status.unavailable { border-color: #b36a55; background: rgba(179, 106, 85, 0.14); color: #ffb19b; }
+    .finetune-live { display: flex; align-items: center; gap: 8px; margin: 8px 0; color: var(--ink-dim); }
+    .finetune-live-icon { color: #77d6ff; font-size: 18px; }
+    .finetune-live-icon.running { animation: finetunePulse 1.1s ease-in-out infinite; }
+    .finetune-time-track { height: 6px; flex: 1; background: #22313e; border-radius: 99px; overflow: hidden; }
+    .finetune-time-fill { height: 100%; width: 0%; background: #45b7e8; transition: width .3s ease; }
+    @keyframes finetunePulse { 50% { opacity: .35; transform: scale(1.25); } }
     .rag-metrics-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -3245,6 +3696,7 @@ def index() -> str:
       <button id="tabRagMetricsBtn" class="tab-btn" onclick="switchTab('rag_metrics')">RAG Metrics</button>
       <button id="tabLlmBtn" class="tab-btn" onclick="switchTab('llm')">LLM</button>
       <button id="tabDeepEvalBtn" class="tab-btn" onclick="switchTab('deepeval')">DeepEval Judge</button>
+      <button id="tabFineTuningBtn" class="tab-btn" onclick="switchTab('fine_tuning')">Fine Tuning</button>
       <button id="tabProducerBtn" class="tab-btn" onclick="switchTab('producer')">Kafka Producer</button>
       <button id="tabConsumerBtn" class="tab-btn" onclick="switchTab('consumer')">Kafka Consumer</button>
       <button id="tabGrafanaBtn" class="tab-btn" onclick="switchTab('grafana')">Grafana</button>
@@ -3258,6 +3710,23 @@ def index() -> str:
         <span class="severity-key good">Green = GOOD</span>
         <span class="severity-key warn">Yellow = WARN</span>
         <span class="severity-key bad">Red = BAD</span>
+      </div>
+      <div id="hitlPanel" class="hitl-panel hidden">
+        <div class="hitl-header">
+          <div>
+            <h3>Human-in-the-Loop Approval</h3>
+            <p class="statusline">Review the Monitor's A2A message and the Doer's proposed repair plan before execution.</p>
+          </div>
+          <label class="hitl-mode" for="hitlToggle">
+            <span id="hitlModeLabel">Human approval ON</span>
+            <span class="hitl-switch">
+              <input id="hitlToggle" type="checkbox" onchange="toggleHitlMode()" />
+              <span class="hitl-slider"></span>
+            </span>
+          </label>
+        </div>
+        <p class="statusline" id="hitlStatus">Loading approval mode...</p>
+        <div id="hitlTasks"></div>
       </div>
       <div class="actions">
         <button id="refreshStateBtn" onclick="refreshClusterState()">__REFRESH_LABEL__</button>
@@ -3303,6 +3772,7 @@ def index() -> str:
       <div class="launch-row">
         <input id="graphPdfInput" class="file-input" type="file" accept=".pdf,application/pdf" />
         <button id="graphIngestBtn" type="button" onclick="ingestGraphPdf()">Ingest PDF to Neo4j</button>
+        <button id="graphCancelBtn" class="secondary hidden" type="button" onclick="cancelGraphIngest()">Cancel Ingest</button>
       </div>
       <div class="chat-input-row">
         <input id="graphQuestionInput" type="text" placeholder="Ask a question from the ingested PDF graph..." />
@@ -3451,7 +3921,7 @@ def index() -> str:
 
     <section id="deepevalPanel" class="panel hidden">
       <h2>DeepEval LLM-as-a-Judge</h2>
-      <p class="statusline">Local DeepEval watches both agent runtimes and scores answer relevancy plus Kafka operational quality.</p>
+      <p class="statusline">Local DeepEval watches both agents for relevancy, Kafka operational quality, bias, and toxicity.</p>
       <div class="llm-grid">
         <div class="llm-field">
           <label for="deepevalScope">Evaluation scope</label>
@@ -3471,12 +3941,66 @@ def index() -> str:
         <button type="button" class="secondary" onclick="loadDeepEvalStatus()">Refresh Results</button>
         <p class="statusline" id="deepevalStatus">Loading local judge...</p>
       </div>
+      <div class="rag-metrics-grid">
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Evaluated Cases</div>
+          <div class="rag-metric-value" id="deepevalCaseCount">0</div>
+          <div class="rag-metric-sub" id="deepevalRunCount">Across 0 runs</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Metric Pass Rate</div>
+          <div class="rag-metric-value" id="deepevalPassRate">0.0%</div>
+          <div class="rag-metric-sub" id="deepevalMetricCount">0 metric results</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Normalized Quality</div>
+          <div class="rag-metric-value" id="deepevalQualityScore">0.000</div>
+          <div class="rag-metric-sub">Higher is better across mixed metric directions</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Average Evaluation Time</div>
+          <div class="rag-metric-value" id="deepevalAvgDuration">0 ms</div>
+          <div class="rag-metric-sub">Judge latency per evaluation run</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Latest Answer Relevancy</div>
+          <div class="rag-metric-value" id="deepevalAnswerRelevancy">n/a</div>
+          <div class="rag-metric-sub">Higher is better</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Latest Operational Quality</div>
+          <div class="rag-metric-value" id="deepevalOperationalQuality">n/a</div>
+          <div class="rag-metric-sub">Higher is better</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Latest Bias</div>
+          <div class="rag-metric-value" id="deepevalBias">n/a</div>
+          <div class="rag-metric-sub">Lower is better</div>
+        </div>
+        <div class="rag-metric-card">
+          <div class="rag-metric-label">Latest Toxicity</div>
+          <div class="rag-metric-value" id="deepevalToxicity">n/a</div>
+          <div class="rag-metric-sub">Lower is better</div>
+        </div>
+      </div>
+      <h3>Original DeepEval Quality Output</h3>
+      <p class="statusline">The original Answer Relevancy and Kafka Operational Quality scores and judge reasons are preserved here.</p>
       <div class="rag-table-wrap">
         <table class="rag-table">
           <thead>
             <tr><th>Time</th><th>Agent</th><th>Metric</th><th>Score</th><th>Pass</th><th>Judge reason</th></tr>
           </thead>
-          <tbody id="deepevalResultsBody"><tr><td colspan="6">No evaluations yet.</td></tr></tbody>
+          <tbody id="deepevalOriginalResultsBody"><tr><td colspan="6">No original quality evaluations yet.</td></tr></tbody>
+        </table>
+      </div>
+      <h3>Additional DeepEval Safety Output</h3>
+      <p class="statusline">Bias and Toxicity retain their raw lower-is-better scores and independent safety threshold.</p>
+      <div class="rag-table-wrap">
+        <table class="rag-table">
+          <thead>
+            <tr><th>Time</th><th>Agent</th><th>Metric</th><th>Raw score</th><th>Direction</th><th>Pass</th><th>Judge reason</th></tr>
+          </thead>
+          <tbody id="deepevalSafetyResultsBody"><tr><td colspan="7">No safety evaluations yet.</td></tr></tbody>
         </table>
       </div>
       <p class="statusline error" id="deepevalError"></p>
@@ -3545,6 +4069,47 @@ def index() -> str:
       </div>
     </section>
 
+    <section id="fineTuningPanel" class="panel hidden">
+      <h2>Fine Tuning (MLX on Mac)</h2>
+      <p class="statusline">Prepare an MLX-LM fine-tuning run on Apple Silicon. Training executes on the Mac host, not inside the Linux Docker agents.</p>
+      <div id="fineTuningStatus" class="finetune-status" role="status" aria-live="polite">Checking MLX runtime...</div>
+      <div class="finetune-card">
+        <h3>Training configuration</h3>
+        <div class="finetune-grid">
+          <label>Base model<select id="fineTuneModel" onchange="updateFineTuningEstimate()"><option value="mlx-community/Llama-3.2-3B-Instruct-4bit">Llama 3.2 3B Instruct (4-bit)</option><option value="mlx-community/Qwen2.5-3B-Instruct-4bit">Qwen 2.5 3B Instruct (4-bit)</option></select></label>
+          <label>Training data directory<input id="fineTuneData" type="text" value="__MLX_TRAINING_DATA_DIR__" placeholder="/Users/name/training-data or output/fine-tuning" /></label>
+          <label>Output adapter path<select id="fineTuneOutput"><option value="models/kafka-monitor-lora">models/kafka-monitor-lora</option><option value="models/kafka-doer-lora">models/kafka-doer-lora</option></select></label>
+          <label>Iterations<input id="fineTuneIterations" type="number" min="1" step="1" value="600" oninput="updateFineTuningEstimate()" /></label>
+          <label>LoRA rank estimate<input id="fineTuneRank" type="number" min="1" step="1" value="8" oninput="updateFineTuningEstimate()" /></label>
+        </div>
+        <div id="fineTuningEstimate" class="graph-status">Estimated runtime: calculating...</div>
+        <div class="launch-row">
+          <button type="button" onclick="refreshFineTuningStatus()">Refresh MLX Status</button>
+          <button type="button" onclick="validateFineTuningDataset()">Validate Dataset Directory</button>
+          <button type="button" onclick="startFineTuning()">Prepare MLX Fine-Tuning Run</button>
+          <button type="button" onclick="submitFineTuningJob()">Submit Fine-Tuning Job</button>
+          <span id="fineTuningElapsed" class="graph-status">Elapsed: 0.0s</span>
+          <span id="fineTuningProgress" class="graph-status">Progress: 0 / 0 iterations</span>
+        </div>
+        <div class="finetune-live"><span id="fineTuningLiveIcon" class="finetune-live-icon">○</span><span id="fineTuningLiveLabel">Idle</span><span class="finetune-time-track"><span id="fineTuningTimeFill" class="finetune-time-fill"></span></span></div>
+        <pre id="fineTuneCommand" class="hitl-block" hidden></pre>
+        <button id="fineTuneCopyCommand" type="button" onclick="copyFineTuningCommand()" hidden>Copy Mac MLX Command</button>
+        <p id="fineTuningError" class="statusline error"></p>
+      </div>
+      <div class="finetune-card">
+        <h3>Expected MLX-LM dataset format</h3>
+        <p class="statusline">Each dataset directory must contain all three files:</p>
+        <pre class="hitl-block">data/finetuning/kafka-traces/
+├── train.jsonl
+├── valid.jsonl
+└── test.jsonl</pre>
+        <pre class="hitl-block">{"prompt":"Diagnose under-replicated partitions","completion":"Check ISR and broker health before proposing a repair."}</pre>
+        <p class="statusline">Before running fine tuning on the Mac host, install the MLX runtime:</p>
+        <pre class="hitl-block">python -m pip install mlx mlx-lm</pre>
+        <p class="statusline">The Docker UI validates configuration and emits the host command; it does not install MLX inside the container. The installed MLX-LM CLI uses its configured/default LoRA rank; the rank field is used only for duration planning.</p>
+      </div>
+    </section>
+
     <section id="grafanaPanel" class="panel hidden">
       <h2>Grafana (Dark)</h2>
       <p class="statusline">Embedded Grafana in dark mode for Kafka dashboards.</p>
@@ -3568,20 +4133,14 @@ def index() -> str:
   <script>
     const agentProcessRole = '__AGENT_PROCESS_ROLE__';
     const isDoerRuntime = agentProcessRole === 'remediation';
+    const llmProviderDefaults = __LLM_PROVIDER_DEFAULTS_JSON__;
 
     function configureRoleUi() {
       if (!isDoerRuntime) return;
-      for (const id of [
-        'tabGraphRagBtn',
-        'tabRagMetricsBtn',
-        'tabDeepEvalBtn',
-        'tabNeo4jBrowserBtn'
-      ]) {
-        const element = document.getElementById(id);
-        if (element) element.classList.add('hidden');
-      }
       const directChatRow = document.getElementById('directChatRow');
       if (directChatRow) directChatRow.classList.add('hidden');
+      const hitlPanel = document.getElementById('hitlPanel');
+      if (hitlPanel) hitlPanel.classList.remove('hidden');
       const policy = document.getElementById('agentPolicyText');
       if (policy) {
         policy.textContent = 'Repairs are accepted only as authorized A2A tasks from the Monitor Agent.';
@@ -3594,6 +4153,336 @@ def index() -> str:
       for (const id of ['llmTargetMonitor', 'llmTargetJudge', 'llmMonitorChip', 'llmJudgeChip']) {
         const element = document.getElementById(id);
         if (element) element.classList.add('hidden');
+      }
+    }
+
+    function hitlStateLabel(taskState) {
+      const labels = {
+        TASK_STATE_INPUT_REQUIRED: 'AWAITING APPROVAL',
+        TASK_STATE_WORKING: 'WORKING',
+        TASK_STATE_COMPLETED: 'COMPLETED',
+        TASK_STATE_REJECTED: 'REJECTED',
+        TASK_STATE_FAILED: 'FAILED'
+      };
+      return labels[taskState] || String(taskState || 'UNKNOWN').replace('TASK_STATE_', '');
+    }
+
+    function hitlStateClass(taskState) {
+      return String(taskState || '').replace('TASK_STATE_', '').toLowerCase();
+    }
+
+    function renderHitlTasks(tasks) {
+      const container = document.getElementById('hitlTasks');
+      if (!container) return;
+      if (!Array.isArray(tasks) || tasks.length === 0) {
+        container.innerHTML = '<p class="hitl-empty">No A2A remediation tasks have arrived yet.</p>';
+        return;
+      }
+      container.innerHTML = tasks.map(task => {
+        const taskId = String(task.task_id || '');
+        const stateValue = String(task.task_state || '');
+        const waiting = stateValue === 'TASK_STATE_INPUT_REQUIRED';
+        const review = task.human_review || {};
+        const reviewPrompt =
+          '<section class="hitl-review-prompt" aria-label="Human approval decision">' +
+            '<h4>' + esc(review.title || 'Review this Kafka remediation') + '</h4>' +
+            '<div class="hitl-block-label">What\\'s wrong</div>' +
+            '<div class="hitl-what-wrong">' + esc(review.diagnosis || review.issue || task.a2a_message || 'No diagnosis supplied.') + '</div>' +
+            '<div class="hitl-block-label">Suggested ways to fix it</div>' +
+            '<div class="hitl-fix-options">' + renderHitlFixOptions(task, waiting) + '</div>' +
+            '<div class="hitl-review-grid">' +
+              '<div class="hitl-review-item"><strong>Issue selected by Monitor</strong>' + esc(review.issue || task.a2a_message || '') + '</div>' +
+              '<div class="hitl-review-item"><strong>What approval authorizes</strong>' + esc(review.approval_effect || 'Run the proposed Doer plan.') + '</div>' +
+              '<div class="hitl-review-item"><strong>Safety boundary</strong>' + esc(review.safety_boundary || 'Only the selected issue is in scope.') + '</div>' +
+              '<div class="hitl-review-item"><strong>If you reject</strong>' + esc(review.rejection_effect || 'The task ends without execution.') + '</div>' +
+            '</div>' +
+          '</section>';
+        const fullContext = JSON.stringify(task.full_context || {}, null, 2);
+        const decision = task.decision
+          ? '<p class="statusline">Human decision: ' + esc(task.decision.toUpperCase()) +
+              (task.decision_note ? ' — ' + esc(task.decision_note) : '') + '</p>'
+          : '';
+        const outcome = task.result
+          ? '<div class="hitl-block-label">Execution Result</div><pre class="hitl-block">' + esc(task.result) + '</pre>'
+          : (task.error
+              ? '<div class="hitl-block-label">Task Outcome</div><pre class="hitl-block">' + esc(task.error) + '</pre>'
+              : '');
+        const controls = waiting
+          ? '<div class="hitl-decision-row">' +
+              '<input class="hitl-note" id="hitl-note-' + escAttr(taskId) + '" type="text" ' +
+                'placeholder="Optional constraints or decision note" />' +
+              '<button type="button" onclick="decideHitlTask(\\'' + escAttr(taskId) + '\\', \\'approve\\')">Approve Plan &amp; Run Doer</button>' +
+              '<button type="button" class="hitl-reject" onclick="decideHitlTask(\\'' + escAttr(taskId) + '\\', \\'reject\\')">Reject Without Running</button>' +
+            '</div>'
+          : '';
+        return '<article class="hitl-task">' +
+          '<div class="hitl-task-head">' +
+            '<span>Task ' + esc(taskId.slice(0, 12)) + ' • ' + esc(task.updated_at_utc || task.created_at_utc || '') + '</span>' +
+            '<span class="hitl-badge ' + escAttr(hitlStateClass(stateValue)) + '">' + esc(hitlStateLabel(stateValue)) + '</span>' +
+          '</div>' +
+          reviewPrompt +
+          '<div class="hitl-block-label">A2A Message From Monitor</div>' +
+          '<pre class="hitl-block">' + esc(task.a2a_message || '') + '</pre>' +
+          '<div class="hitl-block-label">Doer Plan To Fix The Issue</div>' +
+          '<pre class="hitl-block">' + esc(task.plan || 'No plan was generated.') + '</pre>' +
+          '<details class="hitl-context-details">' +
+            '<summary>View entire context sent to the Doer</summary>' +
+            '<pre class="hitl-block">' + esc(fullContext) + '</pre>' +
+          '</details>' +
+          decision + outcome + controls +
+        '</article>';
+      }).join('');
+    }
+
+    function renderHitlFixOptions(task, waiting) {
+      const lines = String(task.plan || '').split(/\\n+/).map(line => line.trim()).filter(Boolean);
+      if (!lines.length) return '<p class="hitl-empty">The Doer did not generate suggested fixes.</p>';
+      // Legacy inline handler retained for reference; replaced by JSON-safe action construction.
+      /* return lines.map((line, index) => waiting
+        ? '<button type="button" class="hitl-fix-option" onclick="decideHitlTask(\'' + escAttr(String(task.task_id || '')) + '\', \'approve\', \'Suggested fix ' + escAttr(String(index + 1)) + ': ' + escAttr(line) + '\')">' +
+            '<span class="hitl-fix-number">' + String(index + 1) + '.</span><span>' + esc(line.replace(/^\\d+[.)]\\s* /, '')) + '</span></button>'
+        : '<div class="hitl-fix-option"><span class="hitl-fix-number">' + String(index + 1) + '.</span><span>' + esc(line.replace(/^\\d+[.)]\\s* /, '')) + '</span></div>'
+      ).join(''); */
+      return lines.map((line, index) => {
+        const cleanLine = line.replace(/^\\d+[.)]\\s*/, '');
+        const label = 'Suggested fix ' + String(index + 1) + ': ' + cleanLine;
+        if (!waiting) {
+          return '<div class="hitl-fix-option"><span class="hitl-fix-number">' + String(index + 1) + '.</span><span>' + esc(cleanLine) + '</span></div>';
+        }
+        const action = 'decideHitlTask(' + JSON.stringify(String(task.task_id || '')) + ', ' +
+          JSON.stringify('approve') + ', ' + JSON.stringify(label) + ')';
+        return '<button type="button" class="hitl-fix-option" onclick="' + escAttr(action) + '">' +
+          '<span class="hitl-fix-number">' + String(index + 1) + '.</span><span>' + esc(cleanLine) + '</span></button>';
+      }).join('');
+    }
+
+    async function loadHitlState() {
+      if (!isDoerRuntime) return;
+      const status = document.getElementById('hitlStatus');
+      try {
+        const response = await fetch('/api/remediation/hitl');
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not load HITL state');
+        const toggle = document.getElementById('hitlToggle');
+        const label = document.getElementById('hitlModeLabel');
+        if (toggle) toggle.checked = Boolean(data.enabled);
+        if (label) label.textContent = data.enabled ? 'Human approval ON' : 'Automatic execution ON';
+        if (status) {
+          status.textContent = data.enabled
+            ? String(data.pending_count || 0) + ' task(s) waiting. New A2A repairs pause for approval.'
+            : 'New A2A repairs execute automatically. Existing pending tasks still require a decision.';
+        }
+        renderHitlTasks(data.tasks || []);
+      } catch (error) {
+        if (status) status.textContent = 'Approval screen unavailable: ' + String(error);
+      }
+    }
+
+    async function refreshFineTuningStatus() {
+      const status = document.getElementById('fineTuningStatus');
+      if (!status) return;
+      try {
+        const response = await fetch('/api/finetuning/status');
+        const data = await response.json();
+        status.classList.toggle('available', Boolean(data.mlx_available && data.mlx_lm_available));
+        status.classList.toggle('unavailable', !(data.mlx_available && data.mlx_lm_available));
+        status.textContent = data.mlx_available && data.mlx_lm_available
+          ? `MLX AVAILABLE — ${data.platform}. Host training is ready.`
+          : data.platform.toLowerCase().includes('linux')
+            ? `HOST MLX REQUIRED — UI runtime is ${data.platform}. Run MLX on the Mac host.`
+            : `MLX UNAVAILABLE — ${data.platform}. Install mlx and mlx-lm in the Mac host Python environment.`;
+      } catch (error) {
+        status.classList.remove('available');
+        status.classList.add('unavailable');
+        status.textContent = 'MLX status unavailable: ' + String(error);
+      }
+    }
+
+    async function validateFineTuningDataset() {
+      const directory = document.getElementById('fineTuneData').value.trim();
+      const status = document.getElementById('fineTuningStatus');
+      try {
+        const response = await fetch('/api/finetuning/validate', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({data: directory})});
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || response.statusText);
+        if (!data.valid && !data.host_required) throw new Error('Missing: ' + data.missing_files.join(', '));
+        status.textContent = data.host_required
+          ? 'Dataset directory accepted for Mac host: ' + directory + ' (Docker cannot inspect host files). Required: train.jsonl, valid.jsonl, test.jsonl.'
+          : 'Dataset directory is valid: ' + directory;
+      } catch (error) {
+        status.textContent = 'Dataset validation failed: ' + String(error);
+      }
+    }
+
+async function startFineTuning() {
+      const error = document.getElementById('fineTuningError');
+      if (error) error.textContent = '';
+      const elapsed = document.getElementById('fineTuningElapsed');
+      const startedAt = performance.now();
+      if (window.fineTuneElapsedTimer) clearInterval(window.fineTuneElapsedTimer);
+      const updateElapsed = () => {
+        if (elapsed) elapsed.textContent = 'Elapsed: ' + ((performance.now() - startedAt) / 1000).toFixed(1) + 's';
+      };
+      updateElapsed();
+      window.fineTuneElapsedTimer = setInterval(updateElapsed, 100);
+  try {
+    const response = await fetch('/api/finetuning/prepare', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            model: document.getElementById('fineTuneModel').value,
+        data: document.getElementById('fineTuneData').value.trim(),
+            output: document.getElementById('fineTuneOutput').value,
+            iterations: Number(document.getElementById('fineTuneIterations').value || 600),
+            rank: Number(document.getElementById('fineTuneRank').value || 8)
+          })
+        });
+        const responseText = await response.text();
+        let data;
+        try { data = JSON.parse(responseText); } catch (_) { data = {ok: false, error: responseText || 'Empty response from Fine Tuning API'}; }
+        if (!response.ok || !data.ok) throw new Error(data.error || response.statusText);
+        document.getElementById('fineTuningStatus').textContent = 'Prepared host MLX command: ' + data.command;
+        if (data.estimate) renderFineTuningEstimate(data.estimate);
+      } catch (err) {
+        if (error) error.textContent = String(err);
+        const status = document.getElementById('fineTuningStatus');
+        if (status) status.textContent = 'Fine Tuning request failed: ' + String(err);
+      } finally {
+        clearInterval(window.fineTuneElapsedTimer);
+        window.fineTuneElapsedTimer = null;
+        updateElapsed();
+      }
+    }
+
+    function renderFineTuningEstimate(estimate) {
+      const target = document.getElementById('fineTuningEstimate');
+      if (target && estimate) target.textContent = 'Estimated runtime: ' + estimate.label + ' — ' + estimate.basis;
+    }
+
+    function updateFineTuningEstimate() {
+      const model = document.getElementById('fineTuneModel')?.value || '';
+      const iterations = Number(document.getElementById('fineTuneIterations')?.value || 600);
+      const rank = Number(document.getElementById('fineTuneRank')?.value || 8);
+      const modelFactor = /(?:7b|8b|13b)/i.test(model) ? 2.2 : 1.0;
+      const minutes = (Math.max(1, iterations) * 0.45 * modelFactor * Math.max(1, rank) / 8) / 60;
+      const target = document.getElementById('fineTuningEstimate');
+      if (target) target.textContent = 'Estimated runtime: about ' + minutes.toFixed(1) + ' minutes (planning estimate; actual time varies by Mac, sequence length, and dataset).';
+    }
+
+async function submitFineTuningJob() {
+      const status = document.getElementById('fineTuningStatus');
+      const liveIcon = document.getElementById('fineTuningLiveIcon');
+      const liveLabel = document.getElementById('fineTuningLiveLabel');
+      try {
+        const response = await fetch('/api/finetuning/run', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+          model: document.getElementById('fineTuneModel').value,
+          data: document.getElementById('fineTuneData').value,
+          output: document.getElementById('fineTuneOutput').value,
+          iterations: Number(document.getElementById('fineTuneIterations').value || 600),
+          rank: Number(document.getElementById('fineTuneRank').value || 8)
+        })});
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || response.statusText);
+        if (data.status === 'host_required') {
+          status.textContent = data.message + ' Run the command below from the Mac project directory.';
+          const command = document.getElementById('fineTuneCommand');
+          const copy = document.getElementById('fineTuneCopyCommand');
+          if (command) { command.hidden = false; command.textContent = data.command; }
+          if (copy) copy.hidden = false;
+          const liveIcon = document.getElementById('fineTuningLiveIcon');
+          const liveLabel = document.getElementById('fineTuningLiveLabel');
+          if (liveIcon) { liveIcon.textContent = '●'; liveIcon.classList.add('running'); }
+          if (liveLabel) liveLabel.textContent = 'Submitted — waiting for Mac host';
+          return;
+        }
+        status.textContent = 'Fine-tuning job submitted: ' + data.job_id;
+        window.fineTuneJobStartedAt = Date.now();
+        liveIcon.textContent = '●'; liveIcon.classList.add('running'); liveLabel.textContent = 'Processing';
+        pollFineTuningJob(data.job_id);
+      } catch (error) {
+        status.textContent = 'Fine-tuning submission failed: ' + String(error);
+      }
+    }
+
+    async function copyFineTuningCommand() {
+      const command = document.getElementById('fineTuneCommand')?.textContent || '';
+      if (!command) return;
+      await navigator.clipboard.writeText(command);
+      document.getElementById('fineTuningStatus').textContent = 'MLX command copied. Run it on the Mac host to start training.';
+    }
+
+    async function pollFineTuningJob(jobId) {
+      const progress = document.getElementById('fineTuningProgress');
+      const status = document.getElementById('fineTuningStatus');
+      const poll = async () => {
+        try {
+          const response = await fetch('/api/finetuning/jobs/' + encodeURIComponent(jobId));
+          const data = await response.json();
+          if (!response.ok || !data.ok) throw new Error(data.error || response.statusText);
+          if (progress) progress.textContent = 'Progress: ' + (data.progress || 0) + ' / ' + (data.total || 0) + ' iterations';
+          const estimateSeconds = Math.max(1, Number(document.getElementById('fineTuneIterations')?.value || 600) * 0.45);
+          const elapsedSeconds = Math.max(0, (Date.now() - (window.fineTuneJobStartedAt || Date.now())) / 1000);
+          const fill = document.getElementById('fineTuningTimeFill');
+          if (fill) fill.style.width = Math.min(100, (elapsedSeconds / estimateSeconds) * 100).toFixed(1) + '%';
+          if (data.status === 'running') {
+            setTimeout(poll, 1000);
+          } else if (status) {
+            status.textContent = 'Fine-tuning job ' + data.status + ': ' + jobId;
+            const liveIcon = document.getElementById('fineTuningLiveIcon');
+            const liveLabel = document.getElementById('fineTuningLiveLabel');
+            if (liveIcon) { liveIcon.textContent = data.status === 'completed' ? '✓' : '!'; liveIcon.classList.remove('running'); }
+            if (liveLabel) liveLabel.textContent = data.status === 'completed' ? 'Completed' : 'Failed';
+            if (fill && data.status === 'completed') fill.style.width = '100%';
+          }
+        } catch (error) {
+          if (status) status.textContent = 'Fine-tuning progress unavailable: ' + String(error);
+        }
+      };
+      poll();
+    }
+
+    async function toggleHitlMode() {
+      const toggle = document.getElementById('hitlToggle');
+      const requested = Boolean(toggle && toggle.checked);
+      if (toggle) toggle.disabled = true;
+      try {
+        const response = await fetch('/api/remediation/hitl/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: requested })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not update HITL mode');
+      } catch (error) {
+        document.getElementById('statusError').textContent = String(error);
+      } finally {
+        if (toggle) toggle.disabled = false;
+        await loadHitlState();
+      }
+    }
+
+    async function decideHitlTask(taskId, decision, suggestedFix = '') {
+      const noteInput = document.getElementById('hitl-note-' + taskId);
+      const operatorNote = noteInput ? noteInput.value.trim() : '';
+      const note = [suggestedFix, operatorNote].filter(Boolean).join(' | ');
+      document.getElementById('statusError').textContent = '';
+      startExpertBusy(
+        decision === 'approve' ? 'Starting approved remediation...' : 'Rejecting remediation task...',
+        'processing'
+      );
+      try {
+        const response = await fetch('/api/remediation/hitl/tasks/' + encodeURIComponent(taskId) + '/decision', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision, note })
+        });
+        const data = await response.json();
+        if (!data.ok) throw new Error(data.error || 'Could not record human decision');
+        await Promise.all([loadHitlState(), loadState()]);
+      } catch (error) {
+        document.getElementById('statusError').textContent = String(error);
+      } finally {
+        stopExpertBusy();
       }
     }
 
@@ -3662,9 +4551,39 @@ def index() -> str:
       }
     }
 
+    let activeGraphIngestJobId = '';
+
+    function updateGraphBusy(message, kind) {
+      const state = busyState.graph;
+      if (!state) return;
+      state.message = message || state.message;
+      if (kind) state.kind = kind === 'ai' ? 'ai' : 'processing';
+      renderBusy('graph');
+    }
+
+    async function cancelGraphIngest() {
+      if (!activeGraphIngestJobId) return;
+      const cancelBtn = document.getElementById('graphCancelBtn');
+      if (cancelBtn) cancelBtn.disabled = true;
+      try {
+        const response = await fetch(
+          '/api/graphrag/ingest_pdf/cancel/' + encodeURIComponent(activeGraphIngestJobId),
+          {method: 'POST', headers: {'Content-Type': 'application/json'}}
+        );
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || 'Cancel request failed');
+        updateGraphBusy(data.message || 'Cancellation requested...', 'processing');
+        appendGraphLog('agent', '1. [WARN] Cancellation requested. The current bounded AI call will stop at its timeout; no additional chunks will run.');
+      } catch (error) {
+        appendGraphLog('agent', '1. [BAD] Could not cancel graph ingest. Fix: ' + String(error));
+        if (cancelBtn) cancelBtn.disabled = false;
+      }
+    }
+
     async function ingestGraphPdf() {
       const input = document.getElementById('graphPdfInput');
       const btn = document.getElementById('graphIngestBtn');
+      const cancelBtn = document.getElementById('graphCancelBtn');
       if (!input || !input.files || input.files.length === 0) {
         appendGraphLog('agent', '1. [WARN] Choose a PDF file first. Fix: select a Kafka PDF and click ingest again.');
         return;
@@ -3673,19 +4592,58 @@ def index() -> str:
       const formData = new FormData();
       formData.append('pdf', file, file.name);
       btn.disabled = true;
-      startGraphBusy('Ingesting PDF into Graph RAG...', 'ai');
+      startGraphBusy('Uploading and queuing PDF...', 'processing');
       appendGraphLog('user', 'Ingest PDF: ' + file.name);
       try {
         const r = await fetch('/api/graphrag/ingest_pdf', { method: 'POST', body: formData });
         const data = await r.json();
         if (!data.ok) {
           appendGraphLog('agent', '1. [BAD] PDF ingest failed. Fix: ' + (data.error || 'check Neo4j and LLM settings and retry.'));
+        } else if (data.pending) {
+          activeGraphIngestJobId = data.job_id;
+          if (cancelBtn) {
+            cancelBtn.disabled = false;
+            cancelBtn.classList.remove('hidden');
+          }
+          appendGraphLog('agent', '1. [GOOD] PDF ingest queued as job ' + data.job_id + '. Extracting ontology edges in the background...');
+          let finished = false;
+          while (!finished) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            const statusResponse = await fetch('/api/graphrag/ingest_pdf/status/' + encodeURIComponent(data.job_id));
+            const job = await statusResponse.json();
+            if (!job.ok) throw new Error(job.error || 'Unable to read ingest status');
+            const done = Number(job.chunks_processed || 0);
+            const total = Number(job.total_chunks || 0);
+            const current = Number(job.current_chunk || Math.min(total, done + 1));
+            const pct = Number(job.progress || 0);
+            const elapsed = formatElapsedMs(Number(job.elapsed_ms || 0));
+            const eta = job.estimated_remaining_ms == null
+              ? 'calculating ETA'
+              : 'ETA ' + formatElapsedMs(Number(job.estimated_remaining_ms || 0));
+            const mode = job.extraction_mode === 'deterministic_fallback'
+              ? 'fast deterministic fallback'
+              : 'bounded AI extraction';
+            const progressText = job.cancel_requested
+              ? `Canceling after current chunk ${current}/${total} • elapsed ${elapsed}`
+              : `Chunk ${current}/${total} • ${pct}% • ${mode} • elapsed ${elapsed} • ${eta}`;
+            updateGraphBusy(progressText, job.extraction_mode === 'llm' ? 'ai' : 'processing');
+            document.getElementById('graphRagStatus').textContent =
+              'PDF ingest job ' + data.job_id.slice(0, 10) + ': ' + progressText;
+            if (job.status === 'completed') { appendGraphLog('agent', job.answer); finished = true; }
+            if (job.status === 'failed') { appendGraphLog('agent', '1. [BAD] PDF ingest failed. Fix: ' + job.error); finished = true; }
+            if (job.status === 'canceled') { appendGraphLog('agent', '1. [WARN] PDF ingest canceled without processing additional chunks.'); finished = true; }
+          }
         } else {
           appendGraphLog('agent', data.answer || '1. [GOOD] PDF ingest completed.');
         }
       } catch (e) {
         appendGraphLog('agent', '1. [BAD] Ingest request failed. Fix: ' + String(e));
       } finally {
+        activeGraphIngestJobId = '';
+        if (cancelBtn) {
+          cancelBtn.disabled = false;
+          cancelBtn.classList.add('hidden');
+        }
         btn.disabled = false;
         await loadGraphRagStatus();
         await loadRagMetrics();
@@ -3925,12 +4883,13 @@ def index() -> str:
 
     function updateLlmProviderDefaults(provider) {
       const baseInput = document.getElementById('llmBaseUrlInput');
-      if (!baseInput) return;
-      if (provider === 'ollama') baseInput.value = 'http://ollama:11434/v1';
-      if (provider === 'huggingface') baseInput.value = 'https://router.huggingface.co/v1';
-      if (provider === 'openai' && ['http://ollama:11434/v1', 'https://router.huggingface.co/v1'].includes(baseInput.value)) {
-        baseInput.value = '';
-      }
+      const modelInput = document.getElementById('llmModelInput');
+      const fallbacksInput = document.getElementById('llmFallbacksInput');
+      const defaults = llmProviderDefaults[provider] || {};
+      if (baseInput) baseInput.value = defaults.base_url || '';
+      if (modelInput) modelInput.value = defaults.model || '';
+      if (fallbacksInput) fallbacksInput.value = (defaults.fallbacks || []).join(', ');
+      if (['ollama', 'huggingface'].includes(provider)) loadLlmModels();
     }
 
     async function loadLlmConfig() {
@@ -4070,28 +5029,87 @@ def index() -> str:
 
     let deepEvalRuns = [];
 
+    function renderDeepEvalSummary(scope) {
+      const scopedRuns = [];
+      const scopedCases = [];
+      const metricResults = [];
+      const latestByName = {};
+      for (const run of deepEvalRuns) {
+        let runMatches = false;
+        for (const evalCase of run.cases || []) {
+          if (scope !== 'both' && evalCase.agent_role !== scope) continue;
+          runMatches = true;
+          scopedCases.push(evalCase);
+          for (const metric of evalCase.metrics || []) {
+            metricResults.push(metric);
+            if (!latestByName[metric.name]) latestByName[metric.name] = metric;
+          }
+        }
+        if (runMatches) scopedRuns.push(run);
+      }
+      const passed = metricResults.filter(metric => metric.passed).length;
+      const qualityTotal = metricResults.reduce((total, metric) => {
+        const raw = Number(metric.score || 0);
+        const quality = metric.quality_score === undefined
+          ? (metric.score_direction === 'lower_is_better' ? 1 - raw : raw)
+          : Number(metric.quality_score || 0);
+        return total + quality;
+      }, 0);
+      const averageQuality = metricResults.length ? qualityTotal / metricResults.length : 0;
+      const averageDuration = scopedRuns.length
+        ? scopedRuns.reduce((total, run) => total + Number(run.duration_ms || 0), 0) / scopedRuns.length
+        : 0;
+      const latestScore = name => latestByName[name] ? Number(latestByName[name].score || 0).toFixed(3) : 'n/a';
+
+      setRagText('deepevalCaseCount', scopedCases.length.toLocaleString('en-US'));
+      setRagText('deepevalRunCount', `Across ${scopedRuns.length.toLocaleString('en-US')} runs`);
+      setRagText('deepevalPassRate', metricResults.length ? ((passed / metricResults.length) * 100).toFixed(1) + '%' : '0.0%');
+      setRagText('deepevalMetricCount', `${metricResults.length.toLocaleString('en-US')} metric results`);
+      setRagText('deepevalQualityScore', averageQuality.toFixed(3));
+      setRagText('deepevalAvgDuration', `${Math.round(averageDuration).toLocaleString('en-US')} ms`);
+      setRagText('deepevalAnswerRelevancy', latestScore('AnswerRelevancy'));
+      setRagText('deepevalOperationalQuality', latestScore('Kafka Operational Quality'));
+      setRagText('deepevalBias', latestScore('Bias'));
+      setRagText('deepevalToxicity', latestScore('Toxicity'));
+    }
+
     function renderDeepEvalRuns() {
-      const body = document.getElementById('deepevalResultsBody');
+      const originalBody = document.getElementById('deepevalOriginalResultsBody');
+      const safetyBody = document.getElementById('deepevalSafetyResultsBody');
       const scope = document.getElementById('deepevalScope').value;
-      const rows = [];
+      const originalRows = [];
+      const safetyRows = [];
+      const originalMetricNames = new Set(['AnswerRelevancy', 'Kafka Operational Quality', 'GEval']);
       for (const run of deepEvalRuns) {
         for (const evalCase of run.cases || []) {
           if (scope !== 'both' && evalCase.agent_role !== scope) continue;
           for (const metric of evalCase.metrics || []) {
-            rows.push(
+            const commonStart =
               '<tr>' +
                 '<td>' + esc(run.created_at_utc || '') + '</td>' +
                 '<td>' + esc(String(evalCase.agent_role || '').toUpperCase()) + '</td>' +
                 '<td>' + esc(metric.name || '') + '</td>' +
-                '<td>' + esc(Number(metric.score || 0).toFixed(3)) + '</td>' +
+                '<td>' + esc(Number(metric.score || 0).toFixed(3)) + '</td>';
+            const commonEnd =
                 '<td><span class="rag-status-badge ' + (metric.passed ? 'ok' : 'fail') + '">' + (metric.passed ? 'PASS' : 'FAIL') + '</span></td>' +
                 '<td>' + esc(metric.reason || '') + '</td>' +
-              '</tr>'
-            );
+              '</tr>';
+            if (originalMetricNames.has(metric.name)) {
+              originalRows.push(commonStart + commonEnd);
+            } else {
+              const direction = metric.score_direction === 'lower_is_better' ? 'Lower ↓' : 'Higher ↑';
+              safetyRows.push(commonStart + '<td>' + direction + '</td>' + commonEnd);
+            }
           }
         }
       }
-      body.innerHTML = rows.length ? rows.join('') : '<tr><td colspan="6">No evaluations for this scope yet.</td></tr>';
+      originalBody.innerHTML = originalRows.length
+        ? originalRows.join('')
+        : '<tr><td colspan="6">No original quality evaluations for this scope yet.</td></tr>';
+      safetyBody.innerHTML = safetyRows.length
+        ? safetyRows.join('')
+        : '<tr><td colspan="7">No additional safety evaluations for this scope yet.</td></tr>';
+      renderDeepEvalSummary(scope);
     }
 
     async function loadDeepEvalStatus() {
@@ -4104,7 +5122,7 @@ def index() -> str:
         if (!data.ok) throw new Error(data.error || 'DeepEval is unavailable');
         deepEvalRuns = data.runs || [];
         const health = data.health || {};
-        statusLine.textContent = `Local judge: ${health.judge_model || 'unknown'} | Auto-watch: ${data.auto_evaluate ? 'ON' : 'OFF'} | Runs: ${deepEvalRuns.length}`;
+        statusLine.textContent = `Local judge: ${health.judge_model || 'unknown'} | Auto-watch: ${data.auto_evaluate ? 'ON' : 'OFF'} | Quality threshold: ${health.threshold ?? 0.7} | Safety maximum: ${health.safety_threshold ?? 0.2} | Runs: ${deepEvalRuns.length}`;
         renderDeepEvalRuns();
       } catch (error) {
         errorLine.textContent = String(error);
@@ -4137,57 +5155,30 @@ def index() -> str:
     }
 
     function switchTab(tab) {
-      const expertPanel = document.getElementById('expertPanel');
-      const graphRagPanel = document.getElementById('graphRagPanel');
-      const ragMetricsPanel = document.getElementById('ragMetricsPanel');
-      const kafkaUiPanel = document.getElementById('kafkaUiPanel');
-      const neo4jBrowserPanel = document.getElementById('neo4jBrowserPanel');
-      const producerPanel = document.getElementById('producerPanel');
-      const consumerPanel = document.getElementById('consumerPanel');
-      const grafanaPanel = document.getElementById('grafanaPanel');
-      const llmPanel = document.getElementById('llmPanel');
-      const deepevalPanel = document.getElementById('deepevalPanel');
-      const tabExpertBtn = document.getElementById('tabExpertBtn');
-      const tabGraphRagBtn = document.getElementById('tabGraphRagBtn');
-      const tabRagMetricsBtn = document.getElementById('tabRagMetricsBtn');
-      const tabLlmBtn = document.getElementById('tabLlmBtn');
-      const tabDeepEvalBtn = document.getElementById('tabDeepEvalBtn');
-      const tabProducerBtn = document.getElementById('tabProducerBtn');
-      const tabConsumerBtn = document.getElementById('tabConsumerBtn');
-      const tabGrafanaBtn = document.getElementById('tabGrafanaBtn');
-      const tabNeo4jBrowserBtn = document.getElementById('tabNeo4jBrowserBtn');
-      const tabKafkaUiBtn = document.getElementById('tabKafkaUiBtn');
-      const isExpert = tab === 'expert';
-      const isGraphRag = tab === 'graph_rag';
-      const isRagMetrics = tab === 'rag_metrics';
+      const tabs = {
+        expert: ['expertPanel', 'tabExpertBtn'],
+        graph_rag: ['graphRagPanel', 'tabGraphRagBtn'],
+        rag_metrics: ['ragMetricsPanel', 'tabRagMetricsBtn'],
+        llm: ['llmPanel', 'tabLlmBtn'],
+        deepeval: ['deepevalPanel', 'tabDeepEvalBtn'],
+        fine_tuning: ['fineTuningPanel', 'tabFineTuningBtn'],
+        producer: ['producerPanel', 'tabProducerBtn'],
+        consumer: ['consumerPanel', 'tabConsumerBtn'],
+        grafana: ['grafanaPanel', 'tabGrafanaBtn'],
+        neo4j_browser: ['neo4jBrowserPanel', 'tabNeo4jBrowserBtn'],
+        kafka_ui: ['kafkaUiPanel', 'tabKafkaUiBtn']
+      };
+      // Keep tab switching total: a hidden role-specific control must not
+      // throw and prevent every other tab from responding.
+      Object.values(tabs).forEach(([panelId, buttonId]) => {
+        const panel = document.getElementById(panelId);
+        const button = document.getElementById(buttonId);
+        if (panel) panel.classList.toggle('hidden', panelId !== (tabs[tab] || [])[0]);
+        if (button) button.classList.toggle('active', buttonId === (tabs[tab] || [])[1]);
+      });
       const isLlm = tab === 'llm';
+      const isRagMetrics = tab === 'rag_metrics';
       const isDeepEval = tab === 'deepeval';
-      const isProducer = tab === 'producer';
-      const isConsumer = tab === 'consumer';
-      const isGrafana = tab === 'grafana';
-      const isNeo4jBrowser = tab === 'neo4j_browser';
-      const isKafkaUi = tab === 'kafka_ui';
-
-      expertPanel.classList.toggle('hidden', !isExpert);
-      graphRagPanel.classList.toggle('hidden', !isGraphRag);
-      ragMetricsPanel.classList.toggle('hidden', !isRagMetrics);
-      llmPanel.classList.toggle('hidden', !isLlm);
-      deepevalPanel.classList.toggle('hidden', !isDeepEval);
-      producerPanel.classList.toggle('hidden', !isProducer);
-      consumerPanel.classList.toggle('hidden', !isConsumer);
-      grafanaPanel.classList.toggle('hidden', !isGrafana);
-      neo4jBrowserPanel.classList.toggle('hidden', !isNeo4jBrowser);
-      kafkaUiPanel.classList.toggle('hidden', !isKafkaUi);
-      tabExpertBtn.classList.toggle('active', isExpert);
-      tabGraphRagBtn.classList.toggle('active', isGraphRag);
-      tabRagMetricsBtn.classList.toggle('active', isRagMetrics);
-      tabLlmBtn.classList.toggle('active', isLlm);
-      tabDeepEvalBtn.classList.toggle('active', isDeepEval);
-      tabProducerBtn.classList.toggle('active', isProducer);
-      tabConsumerBtn.classList.toggle('active', isConsumer);
-      tabGrafanaBtn.classList.toggle('active', isGrafana);
-      tabNeo4jBrowserBtn.classList.toggle('active', isNeo4jBrowser);
-      tabKafkaUiBtn.classList.toggle('active', isKafkaUi);
 
       if (isLlm) {
         loadLlmConfig();
@@ -4201,6 +5192,10 @@ def index() -> str:
       if (isDeepEval) {
         loadDeepEvalStatus();
       }
+if (tab === 'fine_tuning') {
+  refreshFineTuningStatus();
+  updateFineTuningEstimate();
+}
     }
 
     function esc(s) {
@@ -4551,6 +5546,26 @@ def index() -> str:
       return stopTimedBusy('llm');
     }
 
+    async function pollRemediationTask(taskId) {
+      const deadline = Date.now() + (10 * 60 * 1000);
+      while (Date.now() < deadline) {
+        await new Promise(resolve => window.setTimeout(resolve, 2000));
+        const busyText = document.getElementById('expertBusyText');
+        if (busyText) busyText.textContent = 'Waiting for a human decision in the Doer UI...';
+        const response = await fetch('/api/auto_fix/tasks/' + encodeURIComponent(taskId));
+        const data = await response.json();
+        await loadState();
+        if (!data.ok && data.terminal) {
+          throw new Error(data.error || 'The remediation task did not run.');
+        }
+        if (!data.ok) {
+          throw new Error(data.error || 'Could not read the remediation task.');
+        }
+        if (data.terminal) return data;
+      }
+      throw new Error('Timed out waiting for the Doer approval decision.');
+    }
+
     async function runFixFromLine(btn) {
       const issueLine = btn.getAttribute('data-issue') || '';
       if (!issueLine) return;
@@ -4574,6 +5589,9 @@ def index() -> str:
         const data = await r.json();
         if (!data.ok) {
           document.getElementById('statusError').textContent = data.error || 'Auto-fix request failed';
+        } else if (data.pending_approval && data.a2a_task_id) {
+          await loadState();
+          await pollRemediationTask(data.a2a_task_id);
         }
         await loadState();
       } catch (e) {
@@ -4702,12 +5720,25 @@ def index() -> str:
       }
       btn.disabled = true;
       document.getElementById('statusError').textContent = '';
-      startExpertBusy('Querying full cluster state...', 'ai');
+        startExpertBusy('Querying full cluster state...', 'ai');
       try {
         const r = await fetch('/api/cluster_state', { method: 'POST', headers: { 'Content-Type': 'application/json' }});
         const data = await r.json();
-        document.getElementById('statusUpdated').textContent = data.status_updated_at || 'n/a';
-        document.getElementById('statusError').textContent = data.last_error || '';
+        if (!r.ok || data.ok === false) throw new Error(data.error || data.last_error || r.statusText || 'Cluster-state query failed');
+        if (data.pending) {
+          document.getElementById('statusError').textContent = 'Assessment is running; waiting for the verified result...';
+          const deadline = Date.now() + 120000;
+          while (Date.now() < deadline) {
+            await new Promise(resolve => window.setTimeout(resolve, 2000));
+            const poll = await fetch('/api/cluster_state/status');
+            const pollData = await poll.json();
+            if (!pollData.running) {
+              if (pollData.error) throw new Error(pollData.error);
+              break;
+            }
+          }
+          if (Date.now() >= deadline) throw new Error('Cluster-state assessment timed out; check the status panel and logs.');
+        }
         await loadState();
       } catch (e) {
         document.getElementById('statusError').textContent = String(e);
@@ -4800,7 +5831,9 @@ def index() -> str:
     loadState();
     loadLlmConfig();
     if (isDoerRuntime) {
+      loadHitlState();
       window.setInterval(loadState, 5000);
+      window.setInterval(loadHitlState, 2500);
     }
   </script>
 </body>
@@ -4819,6 +5852,23 @@ def index() -> str:
         "refresh_label": "Refresh Doer State" if is_doer else "Query Full Cluster State",
         "status_label": "Doer State Updated" if is_doer else "Cluster State Updated",
     }
+    provider_defaults = {
+        "openai": {
+            "model": OPENAI_MODEL,
+            "fallbacks": OPENAI_MODEL_FALLBACKS,
+            "base_url": OPENAI_BASE_URL,
+        },
+        "ollama": {
+            "model": OLLAMA_MODEL,
+            "fallbacks": OLLAMA_MODEL_FALLBACKS,
+            "base_url": OLLAMA_BASE_URL,
+        },
+        "huggingface": {
+            "model": HUGGINGFACE_MODEL,
+            "fallbacks": HUGGINGFACE_MODEL_FALLBACKS,
+            "base_url": HUGGINGFACE_OPENAI_BASE_URL,
+        },
+    }
     return (
         page.replace("__PAGE_TITLE__", role_copy["page_title"]).replace(
             "__PAGE_HEADING__", role_copy["page_heading"]
@@ -4835,7 +5885,11 @@ def index() -> str:
         ).replace(
             "__AGENT_PROCESS_ROLE__", AGENT_PROCESS_ROLE
         ).replace(
+            "__LLM_PROVIDER_DEFAULTS_JSON__", json.dumps(provider_defaults)
+        ).replace(
             "__AI_TOKEN_BUDGET__", str(AI_TOKEN_BUDGET)
+        ).replace(
+            "__MLX_TRAINING_DATA_DIR__", html.escape(MLX_TRAINING_DATA_DIR, quote=True)
         ).replace(
             "__KAFKA_UI_PUBLIC_URL__", KAFKA_UI_PUBLIC_URL
         ).replace(
@@ -4900,6 +5954,27 @@ def _apply_llm_config(
     if provider not in {"openai", "ollama", "huggingface"}:
         return False, f"Unsupported provider '{provider}'."
 
+    previous = {
+        "provider": LLM_PROVIDER,
+        "temperature": LLM_TEMPERATURE,
+        "openai_model": OPENAI_MODEL,
+        "openai_fallbacks": list(OPENAI_MODEL_FALLBACKS),
+        "openai_base_url": OPENAI_BASE_URL,
+        "openai_api_key": OPENAI_API_KEY,
+        "ollama_model": OLLAMA_MODEL,
+        "ollama_fallbacks": list(OLLAMA_MODEL_FALLBACKS),
+        "ollama_base_url": OLLAMA_BASE_URL,
+        "ollama_api_key": OLLAMA_API_KEY,
+        "huggingface_model": HUGGINGFACE_MODEL,
+        "huggingface_fallbacks": list(HUGGINGFACE_MODEL_FALLBACKS),
+        "huggingface_base_url": HUGGINGFACE_OPENAI_BASE_URL,
+        "huggingface_api_key": HUGGINGFACE_API_KEY,
+        "monitor_model": MONITOR_MODEL,
+        "monitor_fallbacks": list(MONITOR_MODEL_FALLBACKS),
+        "remediation_model": REMEDIATION_MODEL,
+        "remediation_fallbacks": list(REMEDIATION_MODEL_FALLBACKS),
+    }
+
     if temperature is not None:
         try:
             LLM_TEMPERATURE = float(temperature)
@@ -4946,7 +6021,32 @@ def _apply_llm_config(
             REMEDIATION_MODEL_FALLBACKS = _dedupe_models(fallbacks)
 
     LLM_PROVIDER = provider
-    return rebuild_runtimes(provider)
+    ok, error = rebuild_runtimes(provider)
+    if ok:
+        return True, ""
+
+    LLM_PROVIDER = str(previous["provider"])
+    LLM_TEMPERATURE = float(previous["temperature"])
+    OPENAI_MODEL = str(previous["openai_model"])
+    OPENAI_MODEL_FALLBACKS = list(previous["openai_fallbacks"])
+    OPENAI_BASE_URL = str(previous["openai_base_url"])
+    OPENAI_API_KEY = str(previous["openai_api_key"])
+    OLLAMA_MODEL = str(previous["ollama_model"])
+    OLLAMA_MODEL_FALLBACKS = list(previous["ollama_fallbacks"])
+    OLLAMA_BASE_URL = str(previous["ollama_base_url"])
+    OLLAMA_API_KEY = str(previous["ollama_api_key"])
+    HUGGINGFACE_MODEL = str(previous["huggingface_model"])
+    HUGGINGFACE_MODEL_FALLBACKS = list(previous["huggingface_fallbacks"])
+    HUGGINGFACE_OPENAI_BASE_URL = str(previous["huggingface_base_url"])
+    HUGGINGFACE_API_KEY = str(previous["huggingface_api_key"])
+    MONITOR_MODEL = str(previous["monitor_model"])
+    MONITOR_MODEL_FALLBACKS = list(previous["monitor_fallbacks"])
+    REMEDIATION_MODEL = str(previous["remediation_model"])
+    REMEDIATION_MODEL_FALLBACKS = list(previous["remediation_fallbacks"])
+    restored, restore_error = rebuild_runtimes(LLM_PROVIDER)
+    if not restored:
+        return False, f"{error} Previous LLM configuration could not be restored: {restore_error}"
+    return False, f"{error} Previous working LLM configuration was restored."
 
 
 def _ollama_model_dirs() -> list[Path]:
@@ -5031,6 +6131,14 @@ def rebuild_runtimes(provider: str) -> tuple[bool, str]:
                 remediation_runtime = None
                 remediation_runtime_error = str(exc)
                 local_error = remediation_runtime_error
+            try:
+                graph_runtime = GraphRAGRuntime()
+                graph_runtime_error = ""
+            except Exception as exc:
+                graph_runtime = None
+                graph_runtime_error = str(exc)
+                if not local_error:
+                    local_error = graph_runtime_error
             return remediation_runtime is not None, local_error
 
         try:
@@ -5070,6 +6178,99 @@ def a2a_json(payload: dict[str, Any], status: int = 200) -> Any:
     response.headers["Content-Type"] = "application/a2a+json"
     response.headers["A2A-Version"] = A2A_PROTOCOL_VERSION
     return response
+
+
+def remediation_task_payload(record: dict[str, Any]) -> dict[str, Any]:
+    """Render one Doer task record as an A2A 1.0 Task response."""
+    state_value = str(record.get("task_state", HITL_FAILED))
+    status_messages = {
+        HITL_INPUT_REQUIRED: "Human approval is required in the Kafka Remediation Agent UI.",
+        HITL_WORKING: "The approved Kafka remediation task is running.",
+        HITL_COMPLETED: "The Kafka remediation task completed.",
+        HITL_REJECTED: str(record.get("error") or "The human operator rejected this remediation task."),
+        HITL_FAILED: str(record.get("error") or "The Kafka remediation task failed."),
+    }
+    artifacts: list[dict[str, Any]] = []
+    if record.get("a2a_message"):
+        artifacts.append(
+            {
+                "artifactId": f"{record['task_id']}-request",
+                "name": "A2A message from Kafka Monitor Agent",
+                "parts": [{"text": str(record["a2a_message"])}],
+            }
+        )
+    if record.get("plan"):
+        artifacts.append(
+            {
+                "artifactId": f"{record['task_id']}-plan",
+                "name": "Proposed Kafka remediation plan",
+                "parts": [{"text": str(record["plan"])}],
+            }
+        )
+    if record.get("result"):
+        artifacts.append(
+            {
+                "artifactId": f"{record['task_id']}-result",
+                "name": "Kafka remediation result",
+                "parts": [{"text": str(record["result"])}],
+            }
+        )
+    return {
+        "task": {
+            "id": str(record["task_id"]),
+            "contextId": str(record.get("context_id", "")),
+            "status": {
+                "state": state_value,
+                "message": {
+                    "messageId": uuid.uuid4().hex,
+                    "contextId": str(record.get("context_id", "")),
+                    "taskId": str(record["task_id"]),
+                    "role": "ROLE_AGENT",
+                    "parts": [{"text": status_messages.get(state_value, state_value)}],
+                },
+                "timestamp": str(record.get("updated_at_utc", utc_now_iso())),
+            },
+            "artifacts": artifacts,
+            "metadata": {
+                "trace": dict(record.get("trace") or {}),
+                "hitl": {
+                    "enabled": bool(record.get("require_approval")),
+                    "decision": str(record.get("decision", "")),
+                    "decision_note": str(record.get("decision_note", "")),
+                },
+            },
+        }
+    }
+
+
+def execute_remediation_task(task_id: str) -> None:
+    """Execute one approved/automatic Doer task and persist its terminal state."""
+    record = remediation_hitl.get(task_id)
+    if record is None or remediation_runtime is None:
+        return
+    try:
+        execution_prompt = str(record["a2a_message"])
+        selected_fix = str(record.get("decision_note", "")).strip()
+        if selected_fix:
+            execution_prompt += (
+                "\n\nHUMAN-SELECTED SUGGESTED FIX (use this as the preferred path, "
+                "subject to live verification):\n" + selected_fix
+            )
+        answer, trace = remediation_runtime.ask_with_trace(
+            execution_prompt,
+            thread_id=f"a2a:{record['context_id']}:{task_id}",
+            prompt_source="a2a_remediation",
+        )
+        remediation_hitl.complete(task_id, result=answer, trace=trace)
+        state.set_last_trace(trace)
+        state.set_status(answer)
+        state.add_chat("remediation", answer)
+        queue_deepeval_observation("remediation", execution_prompt, answer)
+    except Exception as exc:
+        error_text = f"1. [BAD] A2A task {task_id[:12]} failed. Fix: {exc}"
+        remediation_hitl.fail(task_id, error=str(exc))
+        state.set_status(error_text, error=str(exc))
+        state.add_chat("remediation", error_text)
 
 
 @app.get("/.well-known/agent-card.json")
@@ -5148,50 +6349,152 @@ def a2a_remediation_send_message() -> Any:
 
     task_id = uuid.uuid4().hex
     context_id = str(message.get("contextId", "")).strip() or uuid.uuid4().hex
+    message_id = str(message.get("messageId", "")).strip() or uuid.uuid4().hex
     task_label = f"A2A task {task_id[:12]} received (context {context_id[:20]})."
     state.add_chat("user", f"{task_label}\n{prompt}")
+    require_approval = remediation_hitl.enabled()
+    plan = ""
+    plan_trace: dict[str, Any] = {}
+    if require_approval:
+        try:
+            plan, plan_trace = remediation_runtime.plan_with_trace(prompt)
+        except Exception as exc:
+            human_review, full_context = build_review_context(
+                protocol_version=A2A_PROTOCOL_VERSION,
+                endpoint=f"{A2A_REMEDIATION_PUBLIC_URL}/message:send",
+                task_id=task_id,
+                context_id=context_id,
+                message_id=message_id,
+                a2a_message=prompt,
+                plan="",
+                planning_system_prompt=REMEDIATION_PLANNING_SYSTEM_PROMPT,
+                execution_system_prompt=REMEDIATION_SYSTEM_PROMPT,
+                tool_names=list(remediation_runtime._tools_by_name),
+                require_approval=False,
+            )
+            record = remediation_hitl.create(
+                task_id=task_id,
+                context_id=context_id,
+                message_id=message_id,
+                a2a_message=prompt,
+                plan="",
+                require_approval=False,
+                human_review=human_review,
+                full_context=full_context,
+            )
+            remediation_hitl.fail(task_id, error=f"Could not generate remediation plan: {exc}")
+            return a2a_json(remediation_task_payload(remediation_hitl.get(task_id) or record))
+    human_review, full_context = build_review_context(
+        protocol_version=A2A_PROTOCOL_VERSION,
+        endpoint=f"{A2A_REMEDIATION_PUBLIC_URL}/message:send",
+        task_id=task_id,
+        context_id=context_id,
+        message_id=message_id,
+        a2a_message=prompt,
+        plan=plan,
+        planning_system_prompt=REMEDIATION_PLANNING_SYSTEM_PROMPT,
+        execution_system_prompt=REMEDIATION_SYSTEM_PROMPT,
+        tool_names=list(remediation_runtime._tools_by_name),
+        require_approval=require_approval,
+    )
+    record = remediation_hitl.create(
+        task_id=task_id,
+        context_id=context_id,
+        message_id=message_id,
+        a2a_message=prompt,
+        plan=plan,
+        require_approval=require_approval,
+        trace=plan_trace,
+        human_review=human_review,
+        full_context=full_context,
+    )
+    if require_approval:
+        state.set_last_trace(plan_trace)
+        state.set_status(
+            f"1. [WARN] A2A task {task_id[:12]} is waiting for human approval in the Doer UI."
+        )
+        return a2a_json(remediation_task_payload(record))
+
+    execute_remediation_task(task_id)
+    return a2a_json(remediation_task_payload(remediation_hitl.get(task_id) or record))
+
+
+@app.get("/a2a/remediation/tasks/<task_id>")
+def a2a_remediation_get_task(task_id: str) -> Any:
+    """Implement A2A Get Task for Monitor polling after HITL interruption."""
+    if request.headers.get("A2A-Version", "") != A2A_PROTOCOL_VERSION:
+        return jsonify({"title": "Protocol Version Not Supported", "status": 400}), 400
+    if request.headers.get("Authorization", "") != f"Bearer {A2A_REMEDIATION_TOKEN}":
+        return jsonify({"title": "Unauthorized", "status": 401}), 401
+    record = remediation_hitl.get(task_id)
+    if record is None:
+        return jsonify({"title": "Task Not Found", "status": 404}), 404
+    return a2a_json(remediation_task_payload(record))
+
+
+@app.get("/api/remediation/hitl")
+def remediation_hitl_get() -> Any:
+    """Return the Doer's HITL mode and bounded task history for its UI."""
+    if AGENT_PROCESS_ROLE != "remediation":
+        return jsonify({"ok": False, "error": "HITL state is owned by the Doer runtime."}), 404
+    snapshot = remediation_hitl.snapshot()
+    return jsonify(
+        {
+            "ok": True,
+            **snapshot,
+            "pending_count": sum(
+                1 for task in snapshot["tasks"] if task["task_state"] == HITL_INPUT_REQUIRED
+            ),
+        }
+    )
+
+
+@app.post("/api/remediation/hitl/config")
+def remediation_hitl_config() -> Any:
+    """Enable or disable human approval for future Doer A2A tasks."""
+    if AGENT_PROCESS_ROLE != "remediation":
+        return jsonify({"ok": False, "error": "HITL configuration is owned by the Doer runtime."}), 404
+    payload = request.get_json(silent=True) or {}
+    if "enabled" not in payload or not isinstance(payload["enabled"], bool):
+        return jsonify({"ok": False, "error": "enabled must be a boolean"}), 400
+    enabled = remediation_hitl.set_enabled(payload["enabled"])
+    state.add_chat(
+        "user",
+        f"Human-in-the-Loop mode changed to {'ON' if enabled else 'OFF'} for future A2A tasks.",
+    )
+    return jsonify({"ok": True, "enabled": enabled})
+
+
+@app.post("/api/remediation/hitl/tasks/<task_id>/decision")
+def remediation_hitl_decision(task_id: str) -> Any:
+    """Approve or reject one proposed Doer repair from the local HITL screen."""
+    if AGENT_PROCESS_ROLE != "remediation":
+        return jsonify({"ok": False, "error": "HITL decisions are owned by the Doer runtime."}), 404
+    payload = request.get_json(silent=True) or {}
+    decision = str(payload.get("decision", "")).strip().lower()
+    note = str(payload.get("note", "")).strip()
     try:
-        answer, trace = remediation_runtime.ask_with_trace(
-            prompt,
-            thread_id=f"a2a:{context_id}:{task_id}",
-            prompt_source="a2a_remediation",
+        record = remediation_hitl.decide(task_id, decision=decision, note=note)
+    except KeyError:
+        return jsonify({"ok": False, "error": "HITL task not found"}), 404
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    if decision == "approve":
+        state.add_chat("user", f"Human approved A2A task {task_id[:12]}. {note}".strip())
+        threading.Thread(
+            target=execute_remediation_task,
+            args=(task_id,),
+            name=f"hitl-remediation-{task_id[:8]}",
+            daemon=True,
+        ).start()
+    else:
+        rejection_text = note or "Rejected by human operator."
+        state.set_status(
+            f"1. [WARN] A2A task {task_id[:12]} was rejected by the human operator: {rejection_text}"
         )
-        state.set_last_trace(trace)
-        state.set_status(answer)
-        state.add_chat("remediation", answer)
-        return a2a_json(
-            {
-                "task": {
-                    "id": task_id,
-                    "contextId": context_id,
-                    "status": {"state": "TASK_STATE_COMPLETED"},
-                    "artifacts": [
-                        {
-                            "artifactId": uuid.uuid4().hex,
-                            "name": "Kafka remediation result",
-                            "parts": [{"text": answer}],
-                        }
-                    ],
-                    "metadata": {"trace": trace},
-                }
-            }
-        )
-    except Exception as exc:
-        error_text = f"1. [BAD] A2A task {task_id[:12]} failed. Fix: {exc}"
-        state.set_status(error_text, error=str(exc))
-        state.add_chat("remediation", error_text)
-        return a2a_json(
-            {
-                "task": {
-                    "id": task_id,
-                    "contextId": context_id,
-                    "status": {
-                        "state": "TASK_STATE_FAILED",
-                        "message": {"role": "ROLE_AGENT", "parts": [{"text": str(exc)}]},
-                    },
-                }
-            }
-        )
+        state.add_chat("user", f"Human rejected A2A task {task_id[:12]}: {rejection_text}")
+    return jsonify({"ok": True, "task": record})
 
 
 def remote_remediation_health() -> tuple[dict[str, Any], str]:
@@ -5215,7 +6518,7 @@ def remote_remediation_health() -> tuple[dict[str, Any], str]:
 def health() -> Any:
     """Expose runtime health and model configuration visibility for diagnostics."""
     provider = _normalize_llm_provider(LLM_PROVIDER)
-    graph_rt, graph_err = ensure_graph_runtime() if AGENT_PROCESS_ROLE == "monitor" else (None, "")
+    graph_rt, graph_err = ensure_graph_runtime()
     remote_health, remote_health_error = remote_remediation_health()
     monitor_ok = runtime is not None if AGENT_PROCESS_ROLE == "monitor" else False
     remediation_ok = (
@@ -5237,6 +6540,7 @@ def health() -> Any:
     elif graph_rt is not None and getattr(graph_rt, "model_name", ""):
         effective_model = graph_rt.model_name
     fallback_models = _model_candidates_for_provider(provider)
+    hitl_snapshot = remediation_hitl.snapshot() if AGENT_PROCESS_ROLE == "remediation" else {}
     return jsonify(
         {
             "ok": monitor_ok if AGENT_PROCESS_ROLE == "monitor" else remediation_ok,
@@ -5249,6 +6553,12 @@ def health() -> Any:
             "remediation_runtime_location": "remote-a2a" if AGENT_PROCESS_ROLE == "monitor" else "local",
             "a2a_protocol_version": A2A_PROTOCOL_VERSION,
             "a2a_remediation_url": A2A_REMEDIATION_PUBLIC_URL,
+            "remediation_hitl_enabled": hitl_snapshot.get("enabled"),
+            "remediation_hitl_pending_count": sum(
+                1
+                for task in hitl_snapshot.get("tasks", [])
+                if task.get("task_state") == HITL_INPUT_REQUIRED
+            ),
             "graph_rag_ok": graph_rt is not None,
             "llm_provider": provider,
             "llm_model": effective_model,
@@ -5320,6 +6630,112 @@ def llm_config_post() -> Any:
     if not ok:
         cfg["error"] = err
     return jsonify(cfg), status
+
+
+@app.get("/api/finetuning/status")
+def finetuning_status() -> Any:
+    """Report MLX availability for the environment serving this UI."""
+    status = mlx_runtime_status()
+    status["ok"] = True
+    status["host_execution_note"] = (
+        "Training runs on the Mac host; Docker only prepares the command."
+    )
+    status["default_data_directory"] = MLX_TRAINING_DATA_DIR
+    return jsonify(status)
+
+
+@app.post("/api/finetuning/validate")
+def finetuning_validate() -> Any:
+    """Validate an absolute host or project-relative MLX dataset directory."""
+    payload = request.get_json(silent=True) or {}
+    directory = str(payload.get("data", "")).strip()
+    if not directory or directory.startswith("~") or directory.lower().endswith(".jsonl"):
+        return jsonify({"ok": False, "error": "Enter an absolute or project-relative dataset directory, not an individual JSONL file. Expand '~' first."}), 400
+    required = ["train.jsonl", "valid.jsonl", "test.jsonl"]
+    local_path = Path(directory)
+    present = [name for name in required if (local_path / name).is_file()]
+    missing = [name for name in required if name not in present]
+    return jsonify({"ok": True, "directory": directory, "required_files": required, "present_files": present, "missing_files": missing, "valid": not missing, "host_required": not local_path.exists()})
+
+
+@app.post("/api/finetuning/prepare")
+def finetuning_prepare() -> Any:
+    """Validate fine-tuning settings and return a host-side MLX-LM command."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        iterations = int(payload.get("iterations", 600))
+        rank = int(payload.get("rank", 8))
+        command = build_mlx_lora_command(
+            payload.get("model", ""),
+            payload.get("data", ""),
+            payload.get("output", ""),
+            iterations=iterations,
+            rank=rank,
+        )
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    status = mlx_runtime_status()
+    return jsonify(
+        {
+            "ok": True,
+            "command": command,
+            **status,
+            "estimate": estimate_mlx_duration(payload.get("model", ""), iterations, rank),
+            "message": (
+                "Command prepared for the Mac host. Install mlx and mlx-lm there before running it."
+                if not status["mlx_lm_available"]
+                else "Command prepared; run it from the Mac host with the selected dataset."
+            ),
+        }
+    )
+
+
+@app.post("/api/finetuning/run")
+def finetuning_run() -> Any:
+    """Launch MLX-LM in the current host environment when available."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        iterations = int(payload.get("iterations", 600))
+        rank = int(payload.get("rank", 8))
+        args = build_mlx_lora_args(payload.get("model", ""), payload.get("data", ""), payload.get("output", ""), iterations, rank)
+    except (TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    status = mlx_runtime_status()
+    if not status["mlx_lm_available"]:
+        return jsonify({
+            "ok": True,
+            "status": "host_required",
+            "command": " ".join(args),
+            "message": "Docker cannot execute MLX. Run this command from the Mac host.",
+            **status,
+        })
+    job_id = uuid.uuid4().hex
+    try:
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except OSError as exc:
+        return jsonify({"ok": False, "error": f"Could not start MLX-LM: {exc}"}), 500
+    FINETUNING_JOBS[job_id] = {"job_id": job_id, "status": "running", "pid": process.pid, "command": " ".join(args), "progress": 0, "total": iterations}
+
+    def collect() -> None:
+        lines = []
+        for line in process.stdout or ():
+            lines.append(line)
+            match = re.search(r"(?:iter(?:ation)?|step)\s*[:=]?\s*(\d+)", line, re.IGNORECASE)
+            if match:
+                FINETUNING_JOBS[job_id]["progress"] = min(iterations, int(match.group(1)))
+        process.wait()
+        FINETUNING_JOBS[job_id].update({"status": "completed" if process.returncode == 0 else "failed", "returncode": process.returncode, "output": "".join(lines)[-12000:]})
+
+    threading.Thread(target=collect, daemon=True).start()
+    return jsonify({"ok": True, "job_id": job_id, "status": "running", "command": " ".join(args)})
+
+
+@app.get("/api/finetuning/jobs/<job_id>")
+def finetuning_job(job_id: str) -> Any:
+    job = FINETUNING_JOBS.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Fine-tuning job not found"}), 404
+    return jsonify({"ok": True, **job})
 
 
 @app.get("/api/llm/models")
@@ -5421,6 +6837,51 @@ def llm_assignment_post(target: str) -> Any:
 def api_state() -> Any:
     """Return current status text, errors, and chat history snapshot."""
     return jsonify(state.snapshot())
+
+
+@app.get("/api/observability")
+def api_observability() -> Any:
+    """Return the complete agent harness view for either Monitor or Doer.
+
+    This intentionally combines runtime identity/configuration, available tools,
+    latest structured trace, persisted conversation, Graph RAG health, HITL/A2A
+    state, and DeepEval history behind one role-local endpoint.
+    """
+    local_runtime = runtime if AGENT_PROCESS_ROLE == "monitor" else remediation_runtime
+    graph_rt, graph_err = ensure_graph_runtime()
+    graph_status: dict[str, Any] = {}
+    if graph_rt is not None:
+        try:
+            graph_status = graph_rt.status()
+        except Exception as exc:
+            graph_status = {"error": str(exc)}
+    judge_status: dict[str, Any] = {}
+    try:
+        judge_status = {
+            "health": deepeval_request("/health", timeout_seconds=5.0),
+            "runs": deepeval_request("/api/results", timeout_seconds=5.0).get("runs", []),
+        }
+    except Exception as exc:
+        judge_status = {"error": str(exc)}
+    return jsonify(
+        {
+            "ok": True,
+            "agent_process_role": AGENT_PROCESS_ROLE,
+            "runtime": {
+                "available": local_runtime is not None,
+                "provider": _normalize_llm_provider(LLM_PROVIDER),
+                "model": getattr(local_runtime, "model_name", "") if local_runtime else "",
+                "system_prompt_file": getattr(local_runtime, "system_prompt_file", "") if local_runtime else "",
+                "system_prompt_chars": len(getattr(local_runtime, "system_prompt", "")) if local_runtime else 0,
+                "available_tools": sorted(getattr(local_runtime, "_tools_by_name", {}).keys()) if local_runtime else [],
+                "runtime_error": runtime_error if AGENT_PROCESS_ROLE == "monitor" else remediation_runtime_error,
+            },
+            "state": state.snapshot(),
+            "graph_rag": {"ok": graph_rt is not None, "error": graph_err, "status": graph_status},
+            "hitl": remediation_hitl.snapshot() if AGENT_PROCESS_ROLE == "remediation" else None,
+            "deepeval": judge_status,
+        }
+    )
 
 
 def latest_deepeval_cases(scope: str) -> list[dict[str, str]]:
@@ -5547,7 +7008,7 @@ def api_graphrag_metrics_reset() -> Any:
 
 @app.post("/api/graphrag/ingest_pdf")
 def api_graphrag_ingest_pdf() -> Any:
-    """Ingest one uploaded PDF into Neo4j and create graph entities/relations."""
+    """Queue one uploaded PDF for asynchronous Neo4j ontology extraction."""
     graph_rt, graph_err = ensure_graph_runtime()
     if graph_rt is None:
         return jsonify({"ok": False, "error": graph_err or "Graph RAG runtime unavailable."}), 500
@@ -5560,34 +7021,123 @@ def api_graphrag_ingest_pdf() -> Any:
     if not filename.lower().endswith(".pdf"):
         return jsonify({"ok": False, "error": "Only PDF files are supported."}), 400
 
-    started = time.time()
-    try:
-        payload = uploaded.read()
-        result = graph_rt.ingest_pdf(filename=filename, pdf_bytes=payload)
-        duration_ms = int((time.time() - started) * 1000)
-        state.record_graph_ingest(
-            ok=True,
-            duration_ms=duration_ms,
-            source_file=str(result.get("source_file", filename)),
-            chunks_processed=int(result.get("chunks_processed", 0) or 0),
-            edges_created=int(result.get("edges_created", 0) or 0),
-        )
-        answer = (
-            f"1. [GOOD] PDF `{result['source_file']}` ingested into Neo4j Graph RAG.\n"
-            f"2. [GOOD] Chunks processed: {result['chunks_processed']}.\n"
-            f"3. [GOOD] Edges extracted and merged: {result['edges_created']}.\n"
-            "4. [GOOD] Next step: ask a Kafka question in the Graph RAG tab."
-        )
-        return jsonify({"ok": True, "answer": answer, "duration_ms": duration_ms, **result})
-    except Exception as exc:
-        duration_ms = int((time.time() - started) * 1000)
-        state.record_graph_ingest(
-            ok=False,
-            duration_ms=duration_ms,
-            source_file=filename,
-            error=str(exc),
-        )
-        return jsonify({"ok": False, "error": str(exc)}), 500
+    payload = uploaded.read()
+    if not payload:
+        return jsonify({"ok": False, "error": "PDF payload is empty."}), 400
+    job_id = uuid.uuid4().hex
+    with GRAPH_INGEST_JOBS_LOCK:
+        GRAPH_INGEST_JOBS[job_id] = {
+            "job_id": job_id,
+            "status": "queued",
+            "source_file": filename,
+            "progress": 0,
+            "phase": "queued",
+            "chunks_processed": 0,
+            "cancel_requested": False,
+            "_started_at_epoch": time.time(),
+        }
+
+    def run_ingest() -> None:
+        started = time.time()
+        with GRAPH_INGEST_JOBS_LOCK:
+            GRAPH_INGEST_JOBS[job_id].update({"status": "running", "phase": "extracting_pdf"})
+        try:
+            def progress(done: int, total: int, **details: Any) -> None:
+                with GRAPH_INGEST_JOBS_LOCK:
+                    job = GRAPH_INGEST_JOBS[job_id]
+                    current_chunk = int(details.get("current_chunk", 0) or 0)
+                    if current_chunk and current_chunk != int(job.get("current_chunk", 0) or 0):
+                        job["_chunk_started_at_epoch"] = time.time()
+                    job.update(
+                        {
+                            "progress": round((done / total) * 100) if total else 0,
+                            "chunks_processed": done,
+                            "total_chunks": total,
+                            **details,
+                        }
+                    )
+
+            def should_cancel() -> bool:
+                with GRAPH_INGEST_JOBS_LOCK:
+                    return bool(GRAPH_INGEST_JOBS.get(job_id, {}).get("cancel_requested"))
+
+            result = graph_rt.ingest_pdf(
+                filename=filename,
+                pdf_bytes=payload,
+                progress_callback=progress,
+                should_cancel=should_cancel,
+            )
+            duration_ms = int((time.time() - started) * 1000)
+            state.record_graph_ingest(ok=True, duration_ms=duration_ms, source_file=str(result.get("source_file", filename)), chunks_processed=int(result.get("chunks_processed", 0) or 0), edges_created=int(result.get("edges_created", 0) or 0))
+            answer = (
+                f"1. [GOOD] PDF `{result['source_file']}` ingested into Neo4j Graph RAG.\n"
+                f"2. [GOOD] Chunks processed: {result['chunks_processed']}.\n"
+                f"3. [GOOD] Edges extracted and merged: {result['edges_created']}.\n"
+                f"4. [GOOD] Extraction mode: {result['extraction_mode']} "
+                f"({result['fallback_chunks']} fallback chunks).\n"
+                "5. [GOOD] Next step: ask a Kafka question in the Graph RAG tab."
+            )
+            with GRAPH_INGEST_JOBS_LOCK:
+                GRAPH_INGEST_JOBS[job_id].update({"status": "completed", "phase": "completed", "progress": 100, "duration_ms": duration_ms, "answer": answer, **result})
+        except GraphIngestCanceled as exc:
+            duration_ms = int((time.time() - started) * 1000)
+            with GRAPH_INGEST_JOBS_LOCK:
+                GRAPH_INGEST_JOBS[job_id].update(
+                    {"status": "canceled", "phase": "canceled", "duration_ms": duration_ms, "error": str(exc)}
+                )
+        except Exception as exc:
+            duration_ms = int((time.time() - started) * 1000)
+            state.record_graph_ingest(ok=False, duration_ms=duration_ms, source_file=filename, error=str(exc))
+            with GRAPH_INGEST_JOBS_LOCK:
+                GRAPH_INGEST_JOBS[job_id].update({"status": "failed", "phase": "failed", "duration_ms": duration_ms, "error": str(exc)})
+
+    threading.Thread(target=run_ingest, name=f"graphrag-ingest-{job_id[:8]}", daemon=True).start()
+    return jsonify({"ok": True, "pending": True, "job_id": job_id, "source_file": filename}), 202
+
+
+@app.get("/api/graphrag/ingest_pdf/status/<job_id>")
+def api_graphrag_ingest_status(job_id: str) -> Any:
+    """Return asynchronous PDF ontology extraction progress/result."""
+    with GRAPH_INGEST_JOBS_LOCK:
+        job = dict(GRAPH_INGEST_JOBS.get(job_id, {}))
+    if not job:
+        return jsonify({"ok": False, "error": "Graph ingest job not found."}), 404
+    now = time.time()
+    started_at = float(job.pop("_started_at_epoch", now) or now)
+    chunk_started_at = float(job.pop("_chunk_started_at_epoch", now) or now)
+    job["elapsed_ms"] = max(0, int((now - started_at) * 1000))
+    job["current_chunk_elapsed_ms"] = max(0, int((now - chunk_started_at) * 1000))
+    completed = int(job.get("chunks_processed", 0) or 0)
+    total = int(job.get("total_chunks", 0) or 0)
+    job["estimated_remaining_ms"] = (
+        max(0, int((job["elapsed_ms"] / completed) * (total - completed)))
+        if completed > 0 and total > completed
+        else None
+    )
+    return jsonify({"ok": True, **job})
+
+
+@app.post("/api/graphrag/ingest_pdf/cancel/<job_id>")
+def api_graphrag_ingest_cancel(job_id: str) -> Any:
+    """Request cooperative cancellation; active LLM calls stop at the configured timeout."""
+    with GRAPH_INGEST_JOBS_LOCK:
+        job = GRAPH_INGEST_JOBS.get(job_id)
+        if not job:
+            return jsonify({"ok": False, "error": "Graph ingest job not found."}), 404
+        if job.get("status") in {"completed", "failed", "canceled"}:
+            return jsonify({"ok": False, "error": f"Graph ingest job is already {job.get('status')}."}), 409
+        job.update({"cancel_requested": True, "phase": "cancel_requested"})
+    return jsonify(
+        {
+            "ok": True,
+            "job_id": job_id,
+            "status": "cancel_requested",
+            "message": (
+                "Cancellation requested. The current LLM chunk may run until its timeout, "
+                "then no additional chunks will be processed."
+            ),
+        }
+    )
 
 
 @app.post("/api/graphrag/query")
@@ -5628,9 +7178,8 @@ def api_graphrag_query() -> Any:
 
 @app.post("/api/cluster_state")
 def api_cluster_state() -> Any:
-    """Run a full cluster-state assessment prompt and persist the result."""
-    chat_epoch = state.current_chat_epoch()
-    thread_id = state.current_thread_id()
+    """Start a full cluster-state assessment without blocking the browser request."""
+    global cluster_state_running
     if runtime is None:
         err = runtime_error or "Kafka Expert runtime is not available."
         trace = build_static_trace(
@@ -5644,24 +7193,44 @@ def api_cluster_state() -> Any:
             error=err,
         )
         return jsonify({"ok": False, "trace": trace, **state.snapshot()}), 500
+    with cluster_state_lock:
+        if cluster_state_running:
+            return jsonify({"ok": True, "pending": True, "message": "Cluster-state assessment is already running."}), 202
+        cluster_state_running = True
+    state.set_status("Collecting verified full-cluster state...", error="")
 
-    try:
-        answer, trace = runtime.cluster_state_with_trace()
-        state.set_last_trace(trace, epoch=chat_epoch)
-        state.set_status(answer, error="", epoch=chat_epoch)
-        state.add_chat("agent", answer, epoch=chat_epoch)
-        queue_deepeval_observation("monitor", CLUSTER_STATE_PROMPT, answer)
-        return jsonify({"ok": True, "answer": answer, "trace": trace, **state.snapshot()})
-    except Exception as exc:
-        err = str(exc)
-        trace = build_static_trace(
-            prompt_source="cluster_state",
-            user_prompt=CLUSTER_STATE_PROMPT,
-            reason=f"runtime-error: {err}",
-        )
-        state.set_last_trace(trace, epoch=chat_epoch)
-        state.set_status(state.snapshot().get("status_text", ""), error=err, epoch=chat_epoch)
-        return jsonify({"ok": False, "error": err, "trace": trace, **state.snapshot()}), 500
+    def run_assessment() -> None:
+        global cluster_state_running
+        try:
+            answer, trace = runtime.cluster_state_with_trace()
+            state.set_last_trace(trace)
+            state.set_status(answer, error="")
+            state.add_chat("agent", answer)
+            queue_deepeval_observation("monitor", CLUSTER_STATE_PROMPT, answer)
+        except Exception as exc:
+            err = str(exc)
+            trace = build_static_trace(
+                prompt_source="cluster_state",
+                user_prompt=CLUSTER_STATE_PROMPT,
+                reason=f"runtime-error: {err}",
+            )
+            state.set_last_trace(trace)
+            state.set_status("Cluster-state assessment failed.", error=err)
+        finally:
+            with cluster_state_lock:
+                cluster_state_running = False
+
+    threading.Thread(target=run_assessment, name="cluster-state-assessment", daemon=True).start()
+    return jsonify({"ok": True, "pending": True, "status": state.snapshot()}), 202
+
+
+@app.get("/api/cluster_state/status")
+def api_cluster_state_status() -> Any:
+    """Return background full-cluster assessment progress and latest error."""
+    with cluster_state_lock:
+        running = cluster_state_running
+    snapshot = state.snapshot()
+    return jsonify({"ok": True, "running": running, "error": snapshot.get("last_error", "")})
 
 
 @app.post("/api/chat")
@@ -5806,21 +7375,41 @@ def api_auto_fix() -> Any:
     state.add_chat("user", f"Fix handoff to Kafka Remediation Agent: {issue_line}", epoch=chat_epoch)
 
     try:
-        prompt = Template(AUTO_FIX_PROMPT_TEMPLATE).safe_substitute(issue_line=issue_line)
+        snapshot = state.snapshot()
+        handoff = build_monitor_handoff(issue_line, snapshot)
+        prompt = Template(AUTO_FIX_PROMPT_TEMPLATE).safe_substitute(
+            issue_line=handoff["issue_line"],
+            monitor_reason=handoff["monitor_reason"],
+            monitor_context=handoff["monitor_context"],
+        )
         a2a_context_id = f"{thread_id}-remediation-{uuid.uuid4().hex}"
         answer, trace, a2a_task_id = send_a2a_remediation_message(
             prompt,
             context_id=a2a_context_id,
         )
+        task_state = str((trace.get("a2a") or {}).get("task_state", ""))
+        # Keep the extracted diagnosis visible to the Monitor UI even when the
+        # Doer is waiting for HITL approval or returns only a plan artifact.
+        trace["monitor_handoff"] = handoff
         state.set_last_trace(trace, epoch=chat_epoch)
-        state.add_chat("remediation", answer, epoch=chat_epoch)
-        queue_deepeval_observation("remediation", prompt, answer)
+        if task_state == HITL_INPUT_REQUIRED:
+            with completed_a2a_tasks_lock:
+                pending_a2a_prompts[a2a_task_id] = prompt
+            state.add_chat(
+                "remediation",
+                f"Human approval required in the Doer UI.\n\nProposed plan:\n{answer}",
+                epoch=chat_epoch,
+            )
+        else:
+            state.add_chat("remediation", answer, epoch=chat_epoch)
         return jsonify(
             {
                 "ok": True,
                 "answer": answer,
                 "trace": trace,
                 "a2a_task_id": a2a_task_id,
+                "task_state": task_state,
+                "pending_approval": task_state == HITL_INPUT_REQUIRED,
                 **state.snapshot(),
             }
         )
@@ -5834,6 +7423,73 @@ def api_auto_fix() -> Any:
         state.set_last_trace(trace, epoch=chat_epoch)
         state.add_chat("remediation", f"Error: {err}", epoch=chat_epoch)
         return jsonify({"ok": False, "error": err, "trace": trace, **state.snapshot()}), 500
+
+
+@app.get("/api/auto_fix/tasks/<task_id>")
+def api_auto_fix_task(task_id: str) -> Any:
+    """Proxy A2A Get Task so the Monitor can follow a Doer HITL task to completion."""
+    if AGENT_PROCESS_ROLE != "monitor":
+        return jsonify({"ok": False, "error": "A2A task polling is owned by the Monitor runtime."}), 404
+    try:
+        body = get_kafka_a2a_task(
+            base_url=A2A_REMEDIATION_BASE_URL,
+            token=A2A_REMEDIATION_TOKEN,
+            task_id=task_id,
+            timeout_seconds=A2A_REQUEST_TIMEOUT_SECONDS,
+        )
+        task = body.get("task") if isinstance(body, dict) else None
+        task_status = task.get("status", {}) if isinstance(task, dict) else {}
+        task_state = str(task_status.get("state", ""))
+        terminal = task_state in {HITL_COMPLETED, HITL_FAILED, HITL_REJECTED}
+        if task_state in {HITL_FAILED, HITL_REJECTED}:
+            message = task_status.get("message", {}) if isinstance(task_status, dict) else {}
+            parts = message.get("parts", []) if isinstance(message, dict) else []
+            detail = next(
+                (
+                    str(part.get("text"))
+                    for part in parts
+                    if isinstance(part, dict) and part.get("text")
+                ),
+                f"A2A remediation task ended in {task_state}.",
+            )
+            with completed_a2a_tasks_lock:
+                pending_a2a_prompts.pop(task_id, None)
+            state.add_chat("remediation", f"Task {task_id[:12]} ended: {detail}")
+            return jsonify(
+                {
+                    "ok": False,
+                    "terminal": True,
+                    "task_state": task_state,
+                    "error": detail,
+                }
+            )
+
+        answer, trace, parsed_task_id, parsed_state = extract_kafka_a2a_task_update(body, "")
+        if parsed_state == HITL_COMPLETED:
+            should_record = False
+            prompt = ""
+            with completed_a2a_tasks_lock:
+                if parsed_task_id not in completed_a2a_tasks:
+                    completed_a2a_tasks.add(parsed_task_id)
+                    should_record = True
+                pending_a2a_prompts.pop(parsed_task_id, None)
+            if should_record:
+                state.set_last_trace(trace)
+                state.add_chat("remediation", answer)
+        return jsonify(
+            {
+                "ok": True,
+                "answer": answer,
+                "trace": trace,
+                "a2a_task_id": parsed_task_id,
+                "task_state": parsed_state,
+                "pending_approval": parsed_state == HITL_INPUT_REQUIRED,
+                "terminal": terminal,
+                **state.snapshot(),
+            }
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "terminal": False, "error": str(exc)}), 502
 
 
 @app.post("/api/chat/clear")

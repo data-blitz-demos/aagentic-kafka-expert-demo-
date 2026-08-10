@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+"""Flask producer UI with Avro schema editing and rate-controlled publishing.
+
+``ProducerService`` owns Schema Registry registration, schema-aware sample
+generation, one-shot sends, and the background rate loop.
 """
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import json
 import os
@@ -18,11 +21,16 @@ from urllib import request as urlrequest
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from confluent_kafka import SerializingProducer
+from confluent_kafka import Producer, SerializingProducer
 from confluent_kafka.admin import AdminClient, NewTopic
 from confluent_kafka.serialization import StringSerializer
 from confluent_kafka.schema_registry import Schema, SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
+
+try:
+    from phr_generator import generate_personal_health_record
+except ImportError:  # pragma: no cover - supports importing as scripts.producer_ui
+    from scripts.phr_generator import generate_personal_health_record
 
 
 load_dotenv()
@@ -31,6 +39,8 @@ BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092,localh
 SCHEMA_REGISTRY_URL = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:8081")
 TOPIC = os.getenv("KAFKA_TOPIC", "credit-card-purchases")
 SCHEMA_FILE = Path(os.getenv("SCHEMA_FILE", "schemas/credit_card_purchase.avsc"))
+PHR_TOPIC = os.getenv("PHR_TOPIC", "personal-health-records")
+PHR_SCHEMA_FILE = Path(os.getenv("PHR_SCHEMA_FILE", "schemas/ph-schema.json"))
 DEFAULT_RATE_SECONDS = float(os.getenv("PRODUCER_RATE_SECONDS", "1.0"))
 UI_PORT = int(os.getenv("PRODUCER_UI_PORT", "5050"))
 
@@ -120,6 +130,8 @@ class ProducerService:
         self.lock = threading.Lock()
         self.running = False
         self.rate_seconds = DEFAULT_RATE_SECONDS
+        self.profile = "credit_card"
+        self.topic = TOPIC
         self.sent_count = 0
         self.last_error = ""
         self.last_message: dict[str, Any] | None = None
@@ -128,15 +140,17 @@ class ProducerService:
         self._schema_str = ""
         self._schema_dict: dict[str, Any] = {}
         self._producer: SerializingProducer | None = None
+        self._json_producer: Producer | None = None
         self._worker: threading.Thread | None = None
         self.ensure_topic()
         self.reload_schema_and_producer(force=True)
 
-    def ensure_topic(self) -> None:
+    def ensure_topic(self, topic: str | None = None) -> None:
         """Create the demo topic if needed, tolerating already-exists responses."""
         # Create topic on first run; ignore already-exists condition.
-        topic_cfg = NewTopic(topic=TOPIC, num_partitions=3, replication_factor=3)
-        fut = self.admin.create_topics([topic_cfg]).get(TOPIC)
+        topic_name = topic or self.topic
+        topic_cfg = NewTopic(topic=topic_name, num_partitions=3, replication_factor=3)
+        fut = self.admin.create_topics([topic_cfg]).get(topic_name)
         if fut is not None:
             try:
                 fut.result()
@@ -145,8 +159,9 @@ class ProducerService:
                     raise
 
     def schema_text(self) -> str:
-        """Read and return the current Avro schema text from disk."""
-        return SCHEMA_FILE.read_text(encoding="utf-8")
+        """Read the active profile's schema/documentation text from disk."""
+        path = SCHEMA_FILE if self.profile == "credit_card" else PHR_SCHEMA_FILE
+        return path.read_text(encoding="utf-8")
 
     def save_schema(self, schema_text: str) -> None:
         """Persist edited schema JSON and rebuild producer/serializer state."""
@@ -154,12 +169,15 @@ class ProducerService:
         parsed = json.loads(schema_text)
         if not isinstance(parsed, dict):
             raise ValueError("Schema must be a JSON object")
-        SCHEMA_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SCHEMA_FILE.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
+        path = SCHEMA_FILE if self.profile == "credit_card" else PHR_SCHEMA_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(parsed, indent=2) + "\n", encoding="utf-8")
         self.reload_schema_and_producer(force=True)
 
     def register_schema(self) -> int:
         """Register the current schema under `<topic>-value` and return schema id."""
+        if self.profile != "credit_card":
+            raise ValueError("Personal Health Record payloads are JSON and do not use Schema Registry")
         # Register current schema as the next version for this subject.
         self._set_subject_compatibility_none()
         schema = Schema(self._schema_str, schema_type="AVRO")
@@ -180,15 +198,22 @@ class ProducerService:
             pass
 
     def reload_schema_and_producer(self, force: bool = False) -> None:
-        """Recreate Avro serializer/producer when schema file contents change."""
+        """Recreate the active profile's serializer/producer when its schema changes."""
         # Recreate Avro serializer/producer when schema changes on disk.
         with self.lock:
-            mtime = SCHEMA_FILE.stat().st_mtime if SCHEMA_FILE.exists() else 0.0
+            schema_path = SCHEMA_FILE if self.profile == "credit_card" else PHR_SCHEMA_FILE
+            mtime = schema_path.stat().st_mtime if schema_path.exists() else 0.0
             if not force and mtime == self._schema_mtime and self._producer is not None:
                 return
             self._schema_mtime = mtime
             self._schema_str = self.schema_text()
             self._schema_dict = json.loads(self._schema_str)
+
+            if self.profile == "phr":
+                self._producer = None
+                if self._json_producer is None:
+                    self._json_producer = Producer({"bootstrap.servers": BOOTSTRAP_SERVERS})
+                return
 
             serializer = AvroSerializer(
                 schema_registry_client=self.schema_client,
@@ -203,8 +228,24 @@ class ProducerService:
                 }
             )
 
+    def set_profile(self, profile: str) -> None:
+        """Switch between credit-card Avro and synthetic PHR JSON publishing."""
+        normalized = (profile or "").strip().lower().replace("-", "_")
+        if normalized in {"personal_health_record", "personal_health_records", "health", "phr"}:
+            normalized = "phr"
+        if normalized not in {"credit_card", "phr"}:
+            raise ValueError("profile must be credit_card or phr")
+        with self.lock:
+            self.profile = normalized
+            self.topic = PHR_TOPIC if normalized == "phr" else TOPIC
+            self._schema_mtime = 0.0
+        self.ensure_topic(self.topic)
+        self.reload_schema_and_producer(force=True)
+
     def generate_message(self) -> dict[str, Any]:
-        """Generate one record payload using the current top-level Avro record schema."""
+        """Generate one record payload for the active producer profile."""
+        if self.profile == "phr":
+            return generate_personal_health_record()
         # Generate one payload that conforms to current top-level record schema.
         root_type = self._schema_dict.get("type")
         if root_type != "record":
@@ -216,7 +257,7 @@ class ProducerService:
         # Produce exactly one message and block until delivery completes.
         self.reload_schema_and_producer()
         message = self.generate_message()
-        key = str(message.get("purchase_id", uuid.uuid4()))
+        key = str(message.get("recordId" if self.profile == "phr" else "purchase_id", uuid.uuid4()))
 
         def _delivery(err, msg) -> None:
             """Capture asynchronous delivery errors for UI status reporting."""
@@ -224,9 +265,19 @@ class ProducerService:
                 self.last_error = str(err)
 
         with self.lock:
-            assert self._producer is not None
-            self._producer.produce(topic=TOPIC, key=key, value=message, on_delivery=_delivery)
-            self._producer.flush(10)
+            if self.profile == "phr":
+                assert self._json_producer is not None
+                self._json_producer.produce(
+                    topic=self.topic,
+                    key=key,
+                    value=json.dumps(message).encode("utf-8"),
+                    on_delivery=_delivery,
+                )
+                self._json_producer.flush(10)
+            else:
+                assert self._producer is not None
+                self._producer.produce(topic=self.topic, key=key, value=message, on_delivery=_delivery)
+                self._producer.flush(10)
             self.sent_count += 1
             self.last_message = message
             self.last_sent_at = datetime.now(timezone.utc).isoformat()
@@ -273,8 +324,10 @@ class ProducerService:
                 "last_error": self.last_error,
                 "last_message": self.last_message,
                 "last_sent_at": self.last_sent_at,
-                "topic": TOPIC,
-                "subject": SUBJECT,
+                "profile": self.profile,
+                "topic": self.topic,
+                "subject": f"{self.topic}-value" if self.profile == "credit_card" else None,
+                "schema_file": str(SCHEMA_FILE if self.profile == "credit_card" else PHR_SCHEMA_FILE),
             }
 
 
@@ -339,9 +392,15 @@ def index() -> str:
   </style>
 </head>
 <body>
-  <h1>Kafka Avro Producer UI</h1>
+  <h1>Kafka Producer UI</h1>
   <div class="panel">
     <div class="row">
+      <label>Record profile:
+        <select id="profile" onchange="setProfile()">
+          <option value="credit_card">Credit card purchase (Avro)</option>
+          <option value="phr">Synthetic personal health record (JSON)</option>
+        </select>
+      </label>
       <button class="green" onclick="sendOne()">Send One Message</button>
       <label>Rate (seconds): <input id="rate" type="number" step="0.1" min="0.05" value="{DEFAULT_RATE_SECONDS}"></label>
       <button class="blue" onclick="startRate()">Start Rate Send</button>
@@ -350,10 +409,11 @@ def index() -> str:
     <div class="status" id="status">Loading status...</div>
   </div>
 
-  <div class="panel">
+  <div class="panel" id="schemaPanel">
     <h3>Schema Editor</h3>
+    <div class="status">Credit-card messages use Avro + Schema Registry. PHR messages are synthetic JSON and contain no real patient data.</div>
     <div class="row">
-      <button class="blue" onclick="saveSchema()">Save + Register Schema</button>
+      <button id="saveSchemaButton" class="blue" onclick="saveSchema()">Save + Register Schema</button>
       <button class="blue" onclick="previewMessage()">Preview Generated Message</button>
     </div>
     <textarea id="schema"></textarea>
@@ -375,6 +435,7 @@ def index() -> str:
       const r = await fetch('/api/status');
       const s = await r.json();
       document.getElementById('status').innerHTML =
+        'Profile: <code>' + (s.profile || 'credit_card') + '</code> | ' +
         'Running: <code>' + s.running + '</code> | ' +
         'Rate: <code>' + s.rate_seconds + 's</code> | ' +
         'Sent: <code>' + s.sent_count + '</code> | ' +
@@ -382,6 +443,9 @@ def index() -> str:
         'Subject: <code>' + s.subject + '</code> | ' +
         'Last sent at: <code>' + (s.last_sent_at || 'n/a') + '</code> | ' +
         'Last error: <code>' + (s.last_error || 'none') + '</code>';
+      const profile = document.getElementById('profile');
+      if (profile && profile.value !== (s.profile || 'credit_card')) profile.value = s.profile || 'credit_card';
+      applyProfileUi(s.profile || 'credit_card');
       if (s.last_message) {{
         document.getElementById('message').textContent = JSON.stringify(s.last_message, null, 2);
       }}
@@ -390,8 +454,29 @@ def index() -> str:
     async function sendOne() {{
       const r = await fetch('/api/send_once', {{method:'POST'}});
       const data = await r.json();
+      if (!r.ok) {{ alert(data.error || 'Failed to send message'); return; }}
       document.getElementById('message').textContent = JSON.stringify(data.message || data, null, 2);
       loadStatus();
+    }}
+
+    async function setProfile() {{
+      const profile = document.getElementById('profile').value;
+      const r = await fetch('/api/profile', {{
+        method:'POST', headers: {{'Content-Type':'application/json'}},
+        body: JSON.stringify({{profile}})
+      }});
+      const data = await r.json();
+      if (!r.ok) {{ alert(data.error || 'Failed to select profile'); return; }}
+      await loadSchema();
+      loadStatus();
+    }}
+
+    function applyProfileUi(profile) {{
+      const saveButton = document.getElementById('saveSchemaButton');
+      if (!saveButton) return;
+      const isPhr = profile === 'phr';
+      saveButton.disabled = isPhr;
+      saveButton.title = isPhr ? 'PHR payloads are JSON and are not registered in Schema Registry' : '';
     }}
 
     async function startRate() {{
@@ -447,6 +532,17 @@ def get_schema():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.post("/api/profile")
+def set_profile():
+    """Select the credit-card Avro or synthetic PHR publishing profile."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        svc.set_profile(str(payload.get("profile", "")))
+        return jsonify({"ok": True, **svc.status()})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
 @app.post("/api/schema")
 def set_schema():
     """Persist edited schema and register a new schema version in Schema Registry."""
@@ -454,6 +550,8 @@ def set_schema():
     payload = request.get_json(silent=True) or {}
     schema_text = payload.get("schema", "")
     try:
+        if svc.profile != "credit_card":
+            raise ValueError("PHR payloads are JSON and are not registered in Schema Registry")
         svc.save_schema(schema_text)
         schema_id = svc.register_schema()
         return jsonify({"ok": True, "schema_id": schema_id, "subject": SUBJECT})

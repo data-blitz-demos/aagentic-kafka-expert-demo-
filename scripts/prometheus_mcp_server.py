@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
+"""Prometheus MCP server for Kafka observability and inventory queries.
+
+Exposes instant/range PromQL, bounded cluster-state snapshots, topic/partition
+inventory, consumer-group summaries, and Schema Registry inventory.
 """
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import os
 import json
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
 
@@ -66,7 +70,7 @@ def _prom_get(path: str, params: dict[str, str]) -> dict[str, Any]:
     query = urllib.parse.urlencode(params)
     url = f"{PROMETHEUS_URL}{path}?{query}"
     req = urllib.request.Request(url=url, method="GET")
-    with urllib.request.urlopen(req, timeout=20) as response:
+    with urllib.request.urlopen(req, timeout=8) as response:
         payload = response.read().decode("utf-8")
     return {"queried_at_utc": _utc_now_iso(), "url": url, "raw_json": payload}
 
@@ -190,8 +194,22 @@ def kafka_cluster_state_snapshot() -> dict[str, Any]:
     }
 
     results: dict[str, Any] = {}
-    for name, promql in queries.items():
-        results[name] = _prom_get("/api/v1/query", {"query": promql})
+    # A full snapshot intentionally contains many independent queries. Run
+    # them concurrently so one expensive PromQL expression cannot make the UI
+    # appear frozen while all other health signals are already available.
+    def fetch(item: tuple[str, str]) -> tuple[str, dict[str, Any]]:
+        name, promql = item
+        try:
+            return name, _prom_get("/api/v1/query", {"query": promql})
+        except Exception as exc:
+            return name, {"error": str(exc), "query": promql}
+
+    with ThreadPoolExecutor(max_workers=min(12, max(1, len(queries)))) as pool:
+        futures = [pool.submit(fetch, item) for item in queries.items()]
+        for future in as_completed(futures):
+            name, result = future.result()
+            results[name] = result
+    results = {name: results.get(name, {"error": "query did not return", "query": promql}) for name, promql in queries.items()}
 
     return {
         "prometheus_url": PROMETHEUS_URL,

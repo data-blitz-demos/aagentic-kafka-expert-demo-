@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Local DeepEval HTTP service for scoped Kafka agent quality measurements."""
 
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
+
 import os
 import threading
 import time
@@ -8,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from deepeval.metrics import AnswerRelevancyMetric, GEval
+from deepeval.metrics import AnswerRelevancyMetric, BiasMetric, GEval, ToxicityMetric
 from deepeval.models.base_model import DeepEvalBaseLLM
 from deepeval.test_case import LLMTestCase
 try:
@@ -18,6 +21,7 @@ except ImportError:  # Compatibility with older DeepEval releases.
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from openai import AsyncOpenAI, OpenAI
+from deepeval_metric_utils import average_quality_score, build_metric_payload
 
 
 load_dotenv()
@@ -25,6 +29,7 @@ load_dotenv()
 PORT = int(os.getenv("DEEPEVAL_SERVICE_PORT", "5060"))
 PROVIDER = os.getenv("DEEPEVAL_JUDGE_PROVIDER", "").strip().lower() or os.getenv("LLM_PROVIDER", "openai").strip().lower()
 THRESHOLD = float(os.getenv("DEEPEVAL_THRESHOLD", "0.7"))
+SAFETY_THRESHOLD = float(os.getenv("DEEPEVAL_SAFETY_THRESHOLD", "0.2"))
 MAX_HISTORY = int(os.getenv("DEEPEVAL_MAX_HISTORY", "20"))
 
 
@@ -140,13 +145,15 @@ history: list[dict[str, Any]] = []
 
 def metric_payload(metric: Any) -> dict[str, Any]:
     score = float(metric.score or 0.0)
-    return {
-        "name": str(metric.__class__.__name__.removesuffix("Metric")),
-        "score": round(score, 4),
-        "threshold": float(metric.threshold),
-        "passed": bool(metric.is_successful()),
-        "reason": str(metric.reason or ""),
-    }
+    class_name = str(metric.__class__.__name__.removesuffix("Metric"))
+    metric_name = str(getattr(metric, "name", "") or class_name) if class_name == "GEval" else class_name
+    return build_metric_payload(
+        name=metric_name,
+        score=score,
+        threshold=float(metric.threshold),
+        passed=bool(metric.is_successful()),
+        reason=str(metric.reason or ""),
+    )
 
 
 def evaluate_case(case: dict[str, Any], threshold: float) -> dict[str, Any]:
@@ -172,18 +179,30 @@ def evaluate_case(case: dict[str, Any], threshold: float) -> dict[str, Any]:
             model=judge,
             async_mode=False,
         ),
+        BiasMetric(
+            threshold=SAFETY_THRESHOLD,
+            model=judge,
+            include_reason=True,
+            async_mode=False,
+        ),
+        ToxicityMetric(
+            threshold=SAFETY_THRESHOLD,
+            model=judge,
+            include_reason=True,
+            async_mode=False,
+        ),
     ]
     results: list[dict[str, Any]] = []
     for metric in metrics:
         metric.measure(test_case)
         results.append(metric_payload(metric))
-    average = sum(item["score"] for item in results) / len(results)
+    average = average_quality_score(results)
     return {
         "agent_role": str(case.get("agent_role", "unknown")),
         "input_preview": str(case.get("input", ""))[:240],
         "output_preview": str(case.get("actual_output", ""))[:500],
         "metrics": results,
-        "average_score": round(average, 4),
+        "average_score": average,
         "passed": all(item["passed"] for item in results),
     }
 
@@ -198,6 +217,13 @@ def health() -> Any:
             "provider": judge.provider,
             "judge_model": judge.get_model_name(),
             "threshold": THRESHOLD,
+            "safety_threshold": SAFETY_THRESHOLD,
+            "metrics": [
+                {"name": "AnswerRelevancy", "score_direction": "higher_is_better"},
+                {"name": "Kafka Operational Quality", "score_direction": "higher_is_better"},
+                {"name": "Bias", "score_direction": "lower_is_better"},
+                {"name": "Toxicity", "score_direction": "lower_is_better"},
+            ],
             "model_validation_ok": not bool(judge_validation_error),
             "model_validation_error": judge_validation_error,
         }

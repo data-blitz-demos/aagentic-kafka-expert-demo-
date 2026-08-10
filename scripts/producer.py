@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
+"""CLI Kafka producer for credit-card Avro or synthetic PHR JSON events.
+
+Set ``PRODUCER_PROFILE=phr`` to publish synthetic personal health records to
+``PHR_TOPIC`` (``personal-health-records`` by default).
 """
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import os
 import random
+import json
 import time
 import uuid
 from datetime import datetime, timezone
@@ -14,10 +18,12 @@ from pathlib import Path
 
 from confluent_kafka.admin import AdminClient, NewTopic
 from dotenv import load_dotenv
-from confluent_kafka import SerializingProducer
+from confluent_kafka import Producer, SerializingProducer
 from confluent_kafka.serialization import StringSerializer
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
+
+from phr_generator import generate_personal_health_record
 
 
 PURCHASE_CURRENCIES = ["USD", "CNY"]
@@ -65,29 +71,33 @@ def main() -> None:
 
     bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092,localhost:29092,localhost:39092")
     schema_registry_url = os.getenv("SCHEMA_REGISTRY_URL", "http://localhost:8081")
-    topic = os.getenv("KAFKA_TOPIC", "credit-card-purchases")
+    profile = os.getenv("PRODUCER_PROFILE", "credit_card").strip().lower().replace("-", "_")
+    if profile in {"personal_health_record", "personal_health_records", "health"}:
+        profile = "phr"
+    topic = os.getenv("PHR_TOPIC" if profile == "phr" else "KAFKA_TOPIC", "personal-health-records" if profile == "phr" else "credit-card-purchases")
     schema_path = Path(os.getenv("SCHEMA_FILE", "schemas/credit_card_purchase.avsc"))
     rate_seconds = float(os.getenv("PRODUCER_RATE_SECONDS", "1.0"))
 
-    # Load the schema used by AvroSerializer and connect to Schema Registry.
-    schema_str = schema_path.read_text(encoding="utf-8")
-    schema_client = SchemaRegistryClient({"url": schema_registry_url})
-
-    # Require pre-registered schema so producer and consumers stay pinned to registry schema versions.
-    avro_serializer = AvroSerializer(
-        schema_registry_client=schema_client,
-        schema_str=schema_str,
-        conf={"auto.register.schemas": False},
-    )
-
-    # Create a Kafka producer with string keys and Avro values.
-    producer = SerializingProducer(
-        {
-            "bootstrap.servers": bootstrap_servers,
-            "key.serializer": StringSerializer("utf_8"),
-            "value.serializer": avro_serializer,
-        }
-    )
+    if profile == "phr":
+        # PHR records follow schemas/ph-schema.json and are sent as JSON bytes;
+        # JSON Schema is intentionally not registered as an Avro subject.
+        producer = Producer({"bootstrap.servers": bootstrap_servers})
+    else:
+        # Load the schema used by AvroSerializer and connect to Schema Registry.
+        schema_str = schema_path.read_text(encoding="utf-8")
+        schema_client = SchemaRegistryClient({"url": schema_registry_url})
+        avro_serializer = AvroSerializer(
+            schema_registry_client=schema_client,
+            schema_str=schema_str,
+            conf={"auto.register.schemas": False},
+        )
+        producer = SerializingProducer(
+            {
+                "bootstrap.servers": bootstrap_servers,
+                "key.serializer": StringSerializer("utf_8"),
+                "value.serializer": avro_serializer,
+            }
+        )
 
     # Ensure topic exists before publishing so first run does not fail.
     admin = AdminClient({"bootstrap.servers": bootstrap_servers})
@@ -102,15 +112,16 @@ def main() -> None:
             if "TOPIC_ALREADY_EXISTS" not in str(exc):
                 raise
 
-    print(f"Producing to topic={topic} every {rate_seconds} second(s)")
+    print(f"Producing profile={profile} to topic={topic} every {rate_seconds} second(s)")
     print("Press Ctrl+C to stop")
 
     try:
         while True:
             # Generate one record, publish it, then wait based on configured interval.
-            record = make_purchase()
-            key = record["purchase_id"]
-            producer.produce(topic=topic, key=key, value=record, on_delivery=delivery_report)
+            record = generate_personal_health_record() if profile == "phr" else make_purchase()
+            key = record["recordId"] if profile == "phr" else record["purchase_id"]
+            value = json.dumps(record).encode("utf-8") if profile == "phr" else record
+            producer.produce(topic=topic, key=key, value=value, on_delivery=delivery_report)
             producer.poll(0)
             time.sleep(rate_seconds)
     except KeyboardInterrupt:

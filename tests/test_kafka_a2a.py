@@ -11,6 +11,7 @@ if str(scripts_path) not in sys.path:
 kafka_a2a = importlib.import_module("kafka_a2a")
 build_send_message_request = kafka_a2a.build_send_message_request
 extract_completed_task = kafka_a2a.extract_completed_task
+extract_task_update = kafka_a2a.extract_task_update
 
 
 def test_build_send_message_request_uses_a2a_role_and_text_part() -> None:
@@ -60,3 +61,42 @@ def test_extract_completed_task_surfaces_failed_task_message() -> None:
             },
             "context-2",
         )
+
+
+def test_extract_task_update_accepts_human_input_required() -> None:
+    answer, trace, task_id, state = extract_task_update(
+        {
+            "task": {
+                "id": "task-hitl",
+                "contextId": "context-hitl",
+                "status": {
+                    "state": "TASK_STATE_INPUT_REQUIRED",
+                    "message": {"parts": [{"text": "Human approval required."}]},
+                },
+                "artifacts": [{"parts": [{"text": "1. Verify metrics.\n2. Apply repair."}]}],
+                "metadata": {"hitl": {"enabled": True}},
+            }
+        },
+        "fallback",
+    )
+    assert answer.startswith("1. Verify metrics")
+    assert task_id == "task-hitl"
+    assert state == "TASK_STATE_INPUT_REQUIRED"
+    assert trace["a2a"]["task_state"] == "TASK_STATE_INPUT_REQUIRED"
+
+
+def test_extract_task_update_uses_status_message_when_no_artifact() -> None:
+    answer, _trace, _task_id, state = extract_task_update(
+        {
+            "task": {
+                "id": "task-working",
+                "status": {
+                    "state": "TASK_STATE_WORKING",
+                    "message": {"parts": [{"text": "Repair is running."}]},
+                },
+            }
+        },
+        "context",
+    )
+    assert answer == "Repair is running."
+    assert state == "TASK_STATE_WORKING"

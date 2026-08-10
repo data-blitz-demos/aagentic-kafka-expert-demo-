@@ -1,0 +1,92 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "editorMode": "code",
+          "expr": "kafka_jmx_attribute_value{attribute=~\"$jmx_attribute\",broker=~\"$broker\"}",
+          "legendFormat": "{{broker}} | {{mbean}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Every Numeric JMX Attribute",
+      "type": "gauge"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["jmx", "kafka", "prometheus", "all-attributes", "gauges"],
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": true, "text": "All", "value": ".*"},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Broker Regex",
+        "name": "broker",
+        "options": [],
+        "query": ".*",
+        "skipUrlSync": false,
+        "type": "textbox"
+      },
+      {
+        "allValue": ".*",
+        "current": {"selected": true, "text": "All", "value": ["$__all"]},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(kafka_jmx_attribute_value, attribute)",
+        "includeAll": true,
+        "label": "JMX Attribute",
+        "name": "jmx_attribute",
+        "options": [],
+        "query": {"query": "label_values(kafka_jmx_attribute_value, attribute)", "refId": "StandardVariableQuery"},
+        "refresh": 2,
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-15m", "to": "now"},
+  "timezone": "",
+  "title": "Kafka JMX - Gauge for Every Numeric Attribute",
+  "uid": "kafka-jmx-attribute-gauges",
+  "version": 1,
+  "weekStart": ""
+}

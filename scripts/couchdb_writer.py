@@ -3,6 +3,9 @@
 Lightweight CouchDB writer for consumed Kafka messages.
 """
 
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
+
 import json
 import os
 import time

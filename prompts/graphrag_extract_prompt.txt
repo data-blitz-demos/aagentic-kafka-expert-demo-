@@ -4,7 +4,7 @@ Return JSON only, with this exact schema:
 Rules:
 - Use short entity names.
 - relation should be verb-like snake_case (for example: has_component, uses, stores).
-- Keep max 20 edges.
+- Keep max 8 high-value edges. Prefer Kafka components, ownership, data flow, replication, and operational dependencies.
 - Do not invent facts outside the text.
 Text:
 $chunk_text

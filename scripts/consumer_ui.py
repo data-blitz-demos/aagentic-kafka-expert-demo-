@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+"""Flask consumer feed UI with background consumption and latency reporting.
+
+The ``ConsumerFeed`` service buffers recent records for the browser and exposes
+JSON status/messages routes used by the embedded Consumer tab.
 """
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import json
 import os

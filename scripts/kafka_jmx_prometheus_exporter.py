@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
+"""Poll Kafka JMX and expose numeric attributes as Prometheus metrics.
+
+The exporter queries each configured broker, parses JmxTool CSV output, keeps
+the latest per-broker snapshot, and serves a Prometheus-compatible ``/metrics``
+endpoint.
 """
-Poll Kafka JMX via JmxTool and expose numeric attributes as Prometheus metrics.
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import csv
 import io

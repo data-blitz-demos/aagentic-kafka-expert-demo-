@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
+"""CLI Kafka consumer for the demo's consumed-message workflow.
+
+Reads broker/topic configuration from the environment, consumes records, and
+delegates persistence/processing to the configured consumer pipeline.
 """
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import os
 from datetime import datetime, timezone

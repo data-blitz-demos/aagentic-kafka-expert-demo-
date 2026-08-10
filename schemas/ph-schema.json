@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://data-blitz.example/schemas/ph-schema.json",
+  "title": "Personal Health Record",
+  "description": "A privacy-sensitive personal health record. Do not use this schema as a substitute for clinical guidance or an applicable health-data standard.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["recordId", "patient", "lastUpdated"],
+  "properties": {
+    "recordId": { "type": "string", "minLength": 1 },
+    "patient": { "$ref": "#/$defs/patient" },
+    "lastUpdated": { "type": "string", "format": "date-time" },
+    "conditions": { "type": "array", "items": { "$ref": "#/$defs/clinicalItem" } },
+    "allergies": { "type": "array", "items": { "$ref": "#/$defs/allergy" } },
+    "medications": { "type": "array", "items": { "$ref": "#/$defs/medication" } },
+    "immunizations": { "type": "array", "items": { "$ref": "#/$defs/immunization" } },
+    "observations": { "type": "array", "items": { "$ref": "#/$defs/observation" } },
+    "encounters": { "type": "array", "items": { "$ref": "#/$defs/encounter" } },
+    "procedures": { "type": "array", "items": { "$ref": "#/$defs/procedure" } },
+    "carePlans": { "type": "array", "items": { "$ref": "#/$defs/carePlan" } },
+    "insurance": { "type": "array", "items": { "$ref": "#/$defs/coverage" } },
+    "consents": { "type": "array", "items": { "$ref": "#/$defs/consent" } },
+    "provenance": { "type": "array", "items": { "$ref": "#/$defs/provenance" } }
+  },
+  "$defs": {
+    "code": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "display"],
+      "properties": {
+        "system": { "type": "string", "format": "uri" },
+        "code": { "type": "string", "minLength": 1 },
+        "display": { "type": "string", "minLength": 1 }
+      }
+    },
+    "period": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start": { "type": "string", "format": "date-time" },
+        "end": { "type": "string", "format": "date-time" }
+      },
+      "anyOf": [{ "required": ["start"] }, { "required": ["end"] }]
+    },
+    "patient": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "birthDate"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "givenName": { "type": "string" },
+        "familyName": { "type": "string" },
+        "birthDate": { "type": "string", "format": "date" },
+        "sexAtBirth": { "type": "string" },
+        "genderIdentity": { "type": "string" },
+        "pronouns": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "address": { "type": "string" },
+        "emergencyContact": { "$ref": "#/$defs/contact" }
+      }
+    },
+    "contact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "relationship", "phone"],
+      "properties": {
+        "name": { "type": "string" },
+        "relationship": { "type": "string" },
+        "phone": { "type": "string" },
+        "email": { "type": "string", "format": "email" }
+      }
+    },
+    "clinicalItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "status", "recordedAt"],
+      "properties": {
+        "code": { "$ref": "#/$defs/code" },
+        "status": { "type": "string" },
+        "recordedAt": { "type": "string", "format": "date-time" },
+        "onset": { "type": "string", "format": "date" },
+        "notes": { "type": "string" },
+        "provider": { "type": "string" }
+      }
+    },
+    "allergy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["substance", "reaction", "severity", "status"],
+      "properties": {
+        "substance": { "type": "string" },
+        "reaction": { "type": "string" },
+        "severity": { "type": "string", "enum": ["mild", "moderate", "severe", "unknown"] },
+        "status": { "type": "string", "enum": ["active", "resolved", "refuted", "unknown"] },
+        "recordedAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "medication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "status"],
+      "properties": {
+        "name": { "type": "string" },
+        "rxNormCode": { "type": "string" },
+        "dose": { "type": "string" },
+        "route": { "type": "string" },
+        "frequency": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "completed", "stopped", "on-hold", "unknown"] },
+        "period": { "$ref": "#/$defs/period" },
+        "prescriber": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "immunization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vaccine", "administeredAt"],
+      "properties": {
+        "vaccine": { "type": "string" },
+        "cvxCode": { "type": "string" },
+        "administeredAt": { "type": "string", "format": "date-time" },
+        "doseNumber": { "type": "integer", "minimum": 1 },
+        "lotNumber": { "type": "string" },
+        "administeredBy": { "type": "string" }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value", "observedAt"],
+      "properties": {
+        "name": { "type": "string" },
+        "loincCode": { "type": "string" },
+        "value": {},
+        "unit": { "type": "string" },
+        "referenceRange": { "type": "string" },
+        "observedAt": { "type": "string", "format": "date-time" },
+        "status": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "encounter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "startedAt"],
+      "properties": {
+        "type": { "type": "string" },
+        "provider": { "type": "string" },
+        "organization": { "type": "string" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "endedAt": { "type": "string", "format": "date-time" },
+        "reason": { "type": "string" },
+        "diagnoses": { "type": "array", "items": { "$ref": "#/$defs/code" } },
+        "notes": { "type": "string" }
+      }
+    },
+    "procedure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "performedAt"],
+      "properties": {
+        "code": { "$ref": "#/$defs/code" },
+        "performedAt": { "type": "string", "format": "date-time" },
+        "provider": { "type": "string" },
+        "outcome": { "type": "string" },
+        "notes": { "type": "string" }
+      }
+    },
+    "carePlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "status"],
+      "properties": {
+        "title": { "type": "string" },
+        "status": { "type": "string" },
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "activities": { "type": "array", "items": { "type": "string" } },
+        "startDate": { "type": "string", "format": "date" },
+        "reviewDate": { "type": "string", "format": "date" }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payer", "memberId"],
+      "properties": {
+        "payer": { "type": "string" },
+        "memberId": { "type": "string" },
+        "planName": { "type": "string" },
+        "groupNumber": { "type": "string" },
+        "effectiveDate": { "type": "string", "format": "date" },
+        "terminationDate": { "type": "string", "format": "date" }
+      }
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["purpose", "status", "recordedAt"],
+      "properties": {
+        "purpose": { "type": "string" },
+        "status": { "type": "string", "enum": ["active", "withdrawn", "expired"] },
+        "scope": { "type": "string" },
+        "recordedAt": { "type": "string", "format": "date-time" },
+        "expiresAt": { "type": "string", "format": "date-time" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "recordedAt"],
+      "properties": {
+        "source": { "type": "string" },
+        "sourceRecordId": { "type": "string" },
+        "recordedAt": { "type": "string", "format": "date-time" },
+        "recordedBy": { "type": "string" }
+      }
+    }
+  }
+}

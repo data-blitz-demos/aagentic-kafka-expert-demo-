@@ -5,7 +5,10 @@ x-python-app: &python-app
   environment:
     KAFKA_BOOTSTRAP_SERVERS: kafka1:9092,kafka2:9092,kafka3:9092
     SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    KAFKA_REST_PROXY_URL: http://kafka-rest-proxy:8082
     KAFKA_TOPIC: ${KAFKA_TOPIC}
+    PHR_TOPIC: ${PHR_TOPIC:-personal-health-records}
+    PRODUCER_PROFILE: ${PRODUCER_PROFILE:-credit_card}
     KAFKA_GROUP_ID: ${KAFKA_GROUP_ID}
     CONSUMER_UI_GROUP_ID: ${CONSUMER_UI_GROUP_ID}
     SCHEMA_FILE: /app/schemas/credit_card_purchase.avsc
@@ -32,6 +35,7 @@ x-python-app: &python-app
     A2A_REMEDIATION_PUBLIC_URL: http://localhost:${KAFKA_REMEDIATION_AGENT_PORT:-5053}/a2a/remediation
     A2A_REMEDIATION_HEALTH_URL: http://kafka-remediation-agent:${KAFKA_REMEDIATION_AGENT_PORT:-5053}/api/health
     A2A_REMEDIATION_TOKEN: ${A2A_REMEDIATION_TOKEN:-kafka-demo-a2a-token}
+    REMEDIATION_HITL_ENABLED: ${REMEDIATION_HITL_ENABLED:-true}
     DEEPEVAL_URL: http://deepeval:${DEEPEVAL_SERVICE_PORT:-5060}
     DEEPEVAL_AUTO_EVALUATE: ${DEEPEVAL_AUTO_EVALUATE:-true}
     OPENAI_API_KEY: ${OPENAI_API_KEY}
@@ -55,6 +59,10 @@ x-python-app: &python-app
     NEO4J_PASSWORD: ${NEO4J_PASSWORD}
     NEO4J_AUTH: ${NEO4J_AUTH}
     GRAPH_RAG_MAX_CHUNKS: ${GRAPH_RAG_MAX_CHUNKS}
+    GRAPH_RAG_EXTRACT_MAX_TOKENS: ${GRAPH_RAG_EXTRACT_MAX_TOKENS:-320}
+    GRAPH_RAG_LLM_TIMEOUT_SECONDS: ${GRAPH_RAG_LLM_TIMEOUT_SECONDS:-30}
+    GRAPH_RAG_MAX_EDGES_PER_CHUNK: ${GRAPH_RAG_MAX_EDGES_PER_CHUNK:-8}
+    MLX_TRAINING_DATA_DIR: ${MLX_TRAINING_DATA_DIR:-output/fine-tuning}
   volumes:
     - ./schemas:/app/schemas
     - ./output:/app/output
@@ -71,6 +79,7 @@ services:
       DEEPEVAL_JUDGE_MODEL: ${DEEPEVAL_JUDGE_MODEL:-}
       DEEPEVAL_JUDGE_PROVIDER: ${DEEPEVAL_JUDGE_PROVIDER:-${LLM_PROVIDER}}
       DEEPEVAL_THRESHOLD: ${DEEPEVAL_THRESHOLD:-0.7}
+      DEEPEVAL_SAFETY_THRESHOLD: ${DEEPEVAL_SAFETY_THRESHOLD:-0.2}
       DEEPEVAL_MAX_HISTORY: ${DEEPEVAL_MAX_HISTORY:-20}
       DEEPEVAL_DISABLE_DOTENV: "1"
       DEEPEVAL_TELEMETRY_OPT_OUT: "1"
@@ -289,6 +298,33 @@ services:
       timeout: 5s
       retries: 20
 
+  kafka-rest-proxy:
+    image: confluentinc/cp-kafka-rest:${CP_VERSION}
+    container_name: kafka-rest-proxy
+    hostname: kafka-rest-proxy
+    ports:
+      - "${KAFKA_REST_PROXY_PORT:-8082}:8082"
+    environment:
+      KAFKA_REST_HOST_NAME: kafka-rest-proxy
+      KAFKA_REST_LISTENERS: http://0.0.0.0:8082
+      KAFKA_REST_BOOTSTRAP_SERVERS: PLAINTEXT://kafka1:9092,PLAINTEXT://kafka2:9092,PLAINTEXT://kafka3:9092
+      KAFKA_REST_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    depends_on:
+      kafka1:
+        condition: service_healthy
+      kafka2:
+        condition: service_healthy
+      kafka3:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8082'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   kafka-ui:
     image: provectuslabs/kafka-ui:${KAFKA_UI_VERSION}
     container_name: kafka-ui
@@ -408,6 +444,10 @@ services:
     depends_on:
       prometheus:
         condition: service_started
+      neo4j:
+        condition: service_healthy
+      kafka-rest-proxy:
+        condition: service_healthy
       ollama:
         condition: service_healthy
     healthcheck:
@@ -428,6 +468,8 @@ services:
         condition: service_started
       neo4j:
         condition: service_started
+      kafka-rest-proxy:
+        condition: service_healthy
       ollama:
         condition: service_healthy
       kafka-remediation-agent:

@@ -1,5 +1,8 @@
 """Pure configuration helpers for independent Monitor and Doer LLM runtimes."""
 
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
+
 from collections.abc import Iterable
 
 

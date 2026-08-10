@@ -11,5 +11,6 @@ COPY requirements-deepeval.txt /app/requirements-deepeval.txt
 RUN pip install --no-cache-dir -r /app/requirements-deepeval.txt
 
 COPY scripts/deepeval_service.py /app/scripts/deepeval_service.py
+COPY scripts/deepeval_metric_utils.py /app/scripts/deepeval_metric_utils.py
 
 CMD ["python", "scripts/deepeval_service.py"]

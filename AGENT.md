@@ -28,6 +28,7 @@ Set up a Docker Compose-based Confluent Kafka cluster compatible with local deve
 - Kafka-only chatbot behavior and cluster-state assessment workflow
 - Two-agent operations flow: read-only Monitor Agent and repair-only Remediation Agent
 - A2A 1.0 HTTP+JSON handoff from clicked `Fix:` findings to the Remediation Agent
+- Human-in-the-Loop A2A lifecycle with Doer plan review, approve/reject controls, and Monitor task polling
 - Separate Docker processes for the Monitor Agent (`:5052`) and Remediation Agent (`:5053`)
 - Local DeepEval judge process (`:5060`) observing and scoring both agent outputs
 - All executables run via Docker Compose services only
@@ -133,7 +134,9 @@ Values:
 - `REMEDIATION_LLM_PROVIDER=` (blank uses `LLM_PROVIDER`)
 - `REMEDIATION_MODEL=` (blank uses the selected provider model)
 - `REMEDIATION_MODEL_FALLBACKS=`
+- `REMEDIATION_HITL_ENABLED=true` (pause new Doer tasks for approval)
 - `DEEPEVAL_THRESHOLD=0.7`
+- `DEEPEVAL_SAFETY_THRESHOLD=0.2`
 - `DEEPEVAL_AUTO_EVALUATE=true`
 
 ### 3) Avro schema
@@ -223,6 +226,8 @@ Responsibilities:
   - Serves Kafka Expert UI at `http://localhost:5052`
   - Uses an isolated read-only Monitor Agent process and a separate Remediation Agent process
   - Sends approved monitor findings to the Remediation Agent with A2A 1.0 `POST /message:send`
+  - Uses A2A `TASK_STATE_INPUT_REQUIRED` and `GET /tasks/{task_id}` while a human reviews the Monitor message and Doer plan
+  - Provides a main-tab Human-in-the-Loop switch and per-task Approve/Reject controls in the Doer UI
   - Publishes the Remediation Agent Card at `GET /.well-known/agent-card.json`
   - Provides `Query Full Cluster State` action writing assessment to status panel
   - Provides ten UI tabs, including `Kafka Expert`, `LLM`, `DeepEval Judge`, `Graph RAG`, producer/consumer views, and operations dashboards

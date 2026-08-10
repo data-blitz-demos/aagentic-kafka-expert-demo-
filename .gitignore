@@ -6,3 +6,10 @@ __pycache__/
 *.pyo
 *.pyd
 output/
+
+# Generated local model weights (publish through a model registry or artifact store).
+models/**/*.gguf
+models/**/*.safetensors
+
+# Draw.io autosave files.
+draw.io/.*.dtmp

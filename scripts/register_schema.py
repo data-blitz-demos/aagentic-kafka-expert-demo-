@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""
-Kafka Expert Demo
-Copyright (c) 2026 Paul Harvener, Data-Blitz Inc
-SPDX-License-Identifier: MIT
-"""
+"""Bootstrap the demo Avro schema and Schema Registry compatibility settings."""
+
+__author__ = "Paul Harvener"
+__company__ = "Data-Blitz Inc."
 
 import os
 import json
